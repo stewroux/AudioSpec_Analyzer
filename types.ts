@@ -1,18 +1,37 @@
 export interface AudioMetadata {
   fileName: string;
-  fileSize: number; // in bytes
+  fileSize: number;
   format: string;
-  duration: number; // in seconds
-  sampleRate: number; // in Hz
+  duration: number;
+  sampleRate: number;
   channels: number;
-  detectedBitDepth: string | number; // "16", "24", "32-float", or "Unknown (Compressed)"
-  bitrate: number; // in kbps
+  detectedBitDepth: string | number;
+  bitrate: number;
   isLossless: boolean;
 }
 
-export enum AnalyzeStatus {
-  IDLE = 'IDLE',
-  PROCESSING = 'PROCESSING',
-  COMPLETE = 'COMPLETE',
-  ERROR = 'ERROR'
+export interface Track {
+  id: string;
+  name: string;
+  file?: File;
+  buffer: AudioBuffer;
+  volume: number; // 0.0 to 1.0
+  isMuted: boolean;
+  isSolo: boolean;
+  color: string;
+  originalBitDepth: string; // Display string for UI (e.g., "24-bit PCM")
+}
+
+export interface EditorState {
+  isPlaying: boolean;
+  currentTime: number; // in seconds
+  duration: number; // max duration in seconds
+  zoom: number; // pixels per second
+  verticalScale: 'linear' | 'db'; // Vertical axis mode
+}
+
+export interface AiAnalysisResult {
+  transcription?: string;
+  summary?: string;
+  type: 'transcription' | 'summary';
 }

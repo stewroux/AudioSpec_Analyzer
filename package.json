@@ -1,5 +1,5 @@
 {
-  "name": "audiospec-analyzer",
+  "name": "audiospec-editor",
   "private": true,
   "version": "0.0.0",
   "type": "module",
@@ -11,7 +11,8 @@
   "dependencies": {
     "react-dom": "^19.2.4",
     "react": "^19.2.4",
-    "lucide-react": "^0.563.0"
+    "lucide-react": "^0.563.0",
+    "@google/genai": "^1.40.0"
   },
   "devDependencies": {
     "@types/node": "^22.14.0",

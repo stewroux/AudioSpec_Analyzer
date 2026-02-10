@@ -1,264 +1,421 @@
-import React, { useState } from 'react';
-import { DropZone } from './components/DropZone';
-import { Waveform } from './components/Waveform';
-import { parseWavHeader, detectM4aCodec, formatBytes, formatDuration } from './utils/audioParser';
-import { AudioMetadata, AnalyzeStatus } from './types';
-import { Activity, FileAudio, Info, Mic2, AlertCircle, CheckCircle2, Globe } from 'lucide-react';
+import React, { useState, useRef, useCallback } from 'react';
 import { translations, Language } from './utils/i18n';
+import { Track, EditorState, AiAnalysisResult } from './types';
+import { getAudioContext, decodeAudio, mixTracks, bufferToWav } from './utils/audioEditor';
+import { analyzeAudioWithGemini } from './utils/geminiClient';
+import { parseWavHeader, detectM4aCodec } from './utils/audioParser';
+import { TrackItem } from './components/TrackItem';
+import { Play, Pause, Square, Mic, Upload, Download, Sparkles, AlertCircle, Globe, Plus, Cpu, Ruler } from 'lucide-react';
 
 export default function App() {
   const [lang, setLang] = useState<Language>('ja');
-  const [status, setStatus] = useState<AnalyzeStatus>(AnalyzeStatus.IDLE);
-  const [metadata, setMetadata] = useState<AudioMetadata | null>(null);
-  const [audioBuffer, setAudioBuffer] = useState<AudioBuffer | null>(null);
-  const [errorMsg, setErrorMsg] = useState<string>('');
-
   const t = translations[lang];
 
-  const toggleLanguage = () => {
-    setLang(prev => prev === 'en' ? 'ja' : 'en');
+  // Editor State
+  const [tracks, setTracks] = useState<Track[]>([]);
+  const [editorState, setEditorState] = useState<EditorState>({
+    isPlaying: false,
+    currentTime: 0,
+    duration: 10,
+    zoom: 100,
+    verticalScale: 'linear'
+  });
+  const [isProcessing, setIsProcessing] = useState(false);
+  const [aiResult, setAiResult] = useState<AiAnalysisResult | null>(null);
+  const [errorMessage, setErrorMessage] = useState<string | null>(null);
+
+  // Audio Context Refs
+  const audioContextRef = useRef<AudioContext | null>(null);
+  const sourceNodesRef = useRef<AudioBufferSourceNode[]>([]);
+  const startTimeRef = useRef<number>(0);
+  const animationFrameRef = useRef<number>(0);
+  const mediaRecorderRef = useRef<MediaRecorder | null>(null);
+
+  const initAudioContext = () => {
+    if (!audioContextRef.current) {
+      audioContextRef.current = getAudioContext();
+    }
+    if (audioContextRef.current.state === 'suspended') {
+      audioContextRef.current.resume();
+    }
   };
 
-  const processFile = async (file: File) => {
-    setStatus(AnalyzeStatus.PROCESSING);
-    setErrorMsg('');
-    setMetadata(null);
-    setAudioBuffer(null);
+  const updateDuration = useCallback((currentTracks: Track[]) => {
+    if (currentTracks.length === 0) return;
+    const maxDur = Math.max(...currentTracks.map(t => t.buffer.duration));
+    setEditorState(prev => ({ ...prev, duration: Math.max(10, maxDur) }));
+  }, []);
 
+  // --- Import Logic with Bit Depth Detection ---
+  const handleImport = async (e: React.ChangeEvent<HTMLInputElement>) => {
+    const file = e.target.files?.[0];
+    if (!file) return;
+
+    setIsProcessing(true);
     try {
+      initAudioContext();
+      if (!audioContextRef.current) throw new Error("AudioContext init failed");
+
+      // 1. Detect Bit Depth from original file before decoding
       const arrayBuffer = await file.arrayBuffer();
-      const audioContext = new (window.AudioContext || (window as any).webkitAudioContext)();
+      let bitDepthLabel = "Unknown";
       
-      const buffer = await audioContext.decodeAudioData(arrayBuffer.slice(0));
-      setAudioBuffer(buffer);
-
-      let detectedBitDepth: string | number = "UNKNOWN";
-      let isLossless = false;
-
-      const fileName = file.name.toLowerCase();
-      const fileType = file.type;
-
-      // WAV Analysis
-      if (fileType === 'audio/wav' || fileName.endsWith('.wav')) {
+      if (file.name.endsWith('.wav')) {
         const bits = parseWavHeader(arrayBuffer);
-        if (bits) {
-          detectedBitDepth = bits;
-          isLossless = true;
-        } else {
-          detectedBitDepth = "FLOAT";
-        }
-      } 
-      // FLAC Analysis
-      else if (fileType === 'audio/flac' || fileName.endsWith('.flac')) {
-        detectedBitDepth = "VARIABLE";
-        isLossless = true;
-      }
-      // M4A / MP4 Analysis
-      else if (fileType.includes('m4a') || fileType.includes('mp4') || fileName.endsWith('.m4a') || fileName.endsWith('.mp4')) {
-        const m4aInfo = detectM4aCodec(arrayBuffer);
-        if (m4aInfo) {
-          detectedBitDepth = m4aInfo.codec; // 'ALAC', 'AAC', 'M4A_UNKNOWN'
-          isLossless = m4aInfo.isLossless;
-        } else {
-          detectedBitDepth = "M4A_CONTAINER";
-        }
-      }
-      // Other Compressed
-      else {
-        detectedBitDepth = "COMPRESSED";
-        isLossless = false;
+        bitDepthLabel = bits ? `${bits}-bit PCM` : "32-bit Float";
+      } else if (file.name.endsWith('.flac')) {
+        bitDepthLabel = "Variable (Lossless)";
+      } else if (file.name.match(/\.(m4a|mp4|aac)$/)) {
+        const info = detectM4aCodec(arrayBuffer);
+        bitDepthLabel = info ? info.codec : "AAC/M4A";
+      } else {
+        bitDepthLabel = "Compressed";
       }
 
-      const bitrate = Math.round((file.size * 8) / buffer.duration / 1000);
-
-      const newMetadata: AudioMetadata = {
-        fileName: file.name,
-        fileSize: file.size,
-        format: file.type || 'unknown',
-        duration: buffer.duration,
-        sampleRate: buffer.sampleRate,
-        channels: buffer.numberOfChannels,
-        detectedBitDepth: detectedBitDepth,
-        bitrate: bitrate,
-        isLossless
+      // 2. Decode for Web Audio (converts to 32-bit float internal)
+      const buffer = await audioContextRef.current.decodeAudioData(arrayBuffer.slice(0));
+      
+      const newTrack: Track = {
+        id: crypto.randomUUID(),
+        name: file.name,
+        file: file,
+        buffer: buffer,
+        volume: 1.0,
+        isMuted: false,
+        isSolo: false,
+        color: `hsl(${Math.random() * 360}, 70%, 60%)`,
+        originalBitDepth: bitDepthLabel
       };
 
-      setMetadata(newMetadata);
-      setStatus(AnalyzeStatus.COMPLETE);
+      setTracks(prev => {
+        const next = [...prev, newTrack];
+        updateDuration(next);
+        return next;
+      });
 
     } catch (err) {
       console.error(err);
-      setErrorMsg(t.error);
-      setStatus(AnalyzeStatus.ERROR);
+      setErrorMessage(t.decodeError);
+    } finally {
+      setIsProcessing(false);
+      e.target.value = '';
     }
   };
 
-  const getBitDepthLabel = (val: string | number) => {
-    if (typeof val === 'number') return `${val} ${t.bit}`;
-    switch(val) {
-      case 'FLOAT': return t.code_float;
-      case 'VARIABLE': return t.code_variable;
-      case 'COMPRESSED': return t.code_compressed;
-      case 'M4A_CONTAINER': return t.code_m4a_container;
-      case 'ALAC': return t.code_alac;
-      case 'AAC': return t.code_aac;
-      case 'M4A_UNKNOWN': return t.code_m4a_unknown;
-      case 'UNKNOWN': return t.code_unknown;
-      default: return val;
+  const handleRecord = async () => {
+    try {
+      initAudioContext();
+      const stream = await navigator.mediaDevices.getUserMedia({ audio: true });
+      const recorder = new MediaRecorder(stream);
+      const chunks: Blob[] = [];
+
+      recorder.ondataavailable = (e) => chunks.push(e.data);
+      recorder.onstop = async () => {
+        const blob = new Blob(chunks, { type: 'audio/webm' });
+        if (!audioContextRef.current) return;
+        
+        const arrayBuffer = await blob.arrayBuffer();
+        const audioBuffer = await audioContextRef.current.decodeAudioData(arrayBuffer);
+
+        const newTrack: Track = {
+          id: crypto.randomUUID(),
+          name: "Mic Recording",
+          buffer: audioBuffer,
+          volume: 1.0,
+          isMuted: false,
+          isSolo: false,
+          color: '#ef4444',
+          originalBitDepth: "16-bit (Mic)"
+        };
+
+        setTracks(prev => {
+          const next = [...prev, newTrack];
+          updateDuration(next);
+          return next;
+        });
+        setIsProcessing(false);
+      };
+
+      recorder.start();
+      mediaRecorderRef.current = recorder;
+      setIsProcessing(true); 
+
+    } catch (err) {
+      console.error(err);
+      setErrorMessage(t.micError);
     }
   };
 
-  const getChannelLabel = (ch: number) => {
-    if (ch === 1) return t.mono;
-    if (ch === 2) return t.stereo;
-    return t.multi;
+  const handleStopRecord = () => {
+    if (mediaRecorderRef.current && mediaRecorderRef.current.state === 'recording') {
+      mediaRecorderRef.current.stop();
+      mediaRecorderRef.current.stream.getTracks().forEach(track => track.stop());
+      mediaRecorderRef.current = null;
+    }
+  };
+
+  const handlePlay = () => {
+    if (!audioContextRef.current || tracks.length === 0) return;
+    initAudioContext();
+    if (editorState.isPlaying) handleStop();
+
+    const ctx = audioContextRef.current;
+    const startOffset = editorState.currentTime;
+    const sources: AudioBufferSourceNode[] = [];
+
+    const soloActive = tracks.some(t => t.isSolo);
+    const activeTracks = tracks.filter(t => soloActive ? t.isSolo : !t.isMuted);
+
+    activeTracks.forEach(track => {
+      const source = ctx.createBufferSource();
+      source.buffer = track.buffer;
+      const gainNode = ctx.createGain();
+      gainNode.gain.value = track.volume;
+      source.connect(gainNode);
+      gainNode.connect(ctx.destination);
+
+      if (startOffset < track.buffer.duration) {
+        source.start(ctx.currentTime, startOffset);
+        sources.push(source);
+      }
+    });
+
+    sourceNodesRef.current = sources;
+    startTimeRef.current = ctx.currentTime - startOffset;
+    
+    setEditorState(prev => ({ ...prev, isPlaying: true }));
+
+    const draw = () => {
+      const now = ctx.currentTime;
+      const playbackTime = now - startTimeRef.current;
+      if (playbackTime >= editorState.duration) {
+        handleStop();
+        return;
+      }
+      setEditorState(prev => ({ ...prev, currentTime: playbackTime }));
+      animationFrameRef.current = requestAnimationFrame(draw);
+    };
+    animationFrameRef.current = requestAnimationFrame(draw);
+  };
+
+  const handleStop = () => {
+    sourceNodesRef.current.forEach(node => {
+      try { node.stop(); } catch(e) {}
+    });
+    sourceNodesRef.current = [];
+    if (animationFrameRef.current) cancelAnimationFrame(animationFrameRef.current);
+    setEditorState(prev => ({ ...prev, isPlaying: false }));
+  };
+
+  const handleExport = () => {
+    if (!audioContextRef.current || tracks.length === 0) return;
+    const mixedBuffer = mixTracks(tracks, audioContextRef.current, editorState.duration);
+    const blob = bufferToWav(mixedBuffer);
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement('a');
+    a.href = url;
+    a.download = `mixdown_${new Date().toISOString()}.wav`;
+    a.click();
+    URL.revokeObjectURL(url);
+  };
+
+  const handleAiAction = async (task: 'transcribe' | 'summarize') => {
+    if (!audioContextRef.current || tracks.length === 0) return;
+    setIsProcessing(true);
+    setAiResult(null);
+
+    try {
+      const mixedBuffer = mixTracks(tracks, audioContextRef.current, editorState.duration);
+      const text = await analyzeAudioWithGemini(mixedBuffer, task, lang);
+      setAiResult({
+        type: task === 'transcribe' ? 'transcription' : 'summary',
+        transcription: task === 'transcribe' ? text : undefined,
+        summary: task === 'summarize' ? text : undefined
+      });
+    } catch (err) {
+      console.error(err);
+      setErrorMessage("AI Analysis Failed. Check API Key or Audio length.");
+    } finally {
+      setIsProcessing(false);
+    }
   };
 
   return (
-    <div className="min-h-screen bg-gray-950 text-gray-100 flex flex-col items-center py-12 px-4 sm:px-6 lg:px-8 relative">
+    <div className="min-h-screen bg-gray-950 text-gray-100 flex flex-col font-sans">
       
-      {/* Language Switcher */}
-      <button 
-        onClick={toggleLanguage}
-        className="absolute top-6 right-6 flex items-center gap-2 px-3 py-2 rounded-lg bg-gray-900 border border-gray-800 hover:border-indigo-500 hover:bg-gray-800 transition-colors text-sm font-medium text-gray-300"
-      >
-        <Globe className="w-4 h-4" />
-        <span>{lang === 'ja' ? 'English' : '日本語'}</span>
-      </button>
-
-      <div className="w-full max-w-4xl space-y-8">
-        
-        {/* Header */}
-        <div className="text-center space-y-2">
-          <div className="inline-flex items-center justify-center p-3 bg-gray-900 rounded-xl mb-4 ring-1 ring-gray-800 shadow-lg shadow-indigo-500/10">
-            <Activity className="w-8 h-8 text-indigo-500" />
+      {/* Top Bar */}
+      <header className="bg-gray-900 border-b border-gray-800 p-4 sticky top-0 z-50 shadow-md">
+        <div className="max-w-7xl mx-auto flex flex-col md:flex-row items-center justify-between gap-4">
+          <div className="flex items-center gap-4">
+            <h1 className="text-xl font-bold bg-clip-text text-transparent bg-gradient-to-r from-indigo-400 to-cyan-400">
+              {t.appTitle}
+            </h1>
+            <button onClick={() => setLang(l => l === 'en' ? 'ja' : 'en')} className="p-2 text-gray-400 hover:text-white rounded-full hover:bg-gray-800">
+              <Globe size={18} />
+            </button>
           </div>
-          <h1 className="text-4xl font-bold tracking-tight text-white sm:text-5xl">
-            AudioSpec <span className="text-indigo-500">Analyzer</span>
-          </h1>
-          <p className="text-lg text-gray-400 max-w-2xl mx-auto">
-            {t.subtitle}
-          </p>
+
+          <div className="flex items-center gap-2 bg-gray-800 p-2 rounded-xl border border-gray-700">
+             <button onClick={() => { handleStop(); setEditorState(p => ({...p, currentTime: 0})); }} className="p-2 hover:bg-gray-700 rounded-lg text-gray-300">
+                <Square size={20} fill="currentColor" />
+             </button>
+             
+             {!editorState.isPlaying ? (
+               <button onClick={handlePlay} className="p-3 bg-indigo-600 hover:bg-indigo-500 text-white rounded-full shadow-lg">
+                 <Play size={24} fill="currentColor" className="ml-1" />
+               </button>
+             ) : (
+               <button onClick={() => handleStop()} className="p-3 bg-yellow-600 hover:bg-yellow-500 text-white rounded-full shadow-lg">
+                 <Pause size={24} fill="currentColor" />
+               </button>
+             )}
+
+             <div className="w-px h-8 bg-gray-700 mx-2"></div>
+
+             {mediaRecorderRef.current?.state === 'recording' ? (
+                <button onClick={handleStopRecord} className="flex items-center gap-2 px-3 py-2 bg-red-600 text-white rounded-lg animate-pulse">
+                   <Square size={16} fill="currentColor" />
+                   <span className="text-sm font-bold">REC</span>
+                </button>
+             ) : (
+               <button onClick={handleRecord} className="flex items-center gap-2 px-3 py-2 bg-gray-700 hover:bg-gray-600 text-red-400 rounded-lg">
+                 <Mic size={18} />
+                 <span className="text-sm">REC</span>
+               </button>
+             )}
+          </div>
+
+          <div className="font-mono text-xl text-cyan-400 w-32 text-center bg-gray-900 py-1 rounded border border-gray-800">
+            {new Date(editorState.currentTime * 1000).toISOString().substr(14, 8)}
+          </div>
+
+          <div className="flex gap-2">
+            <label className="flex items-center gap-2 px-3 py-2 bg-gray-800 hover:bg-gray-700 rounded-lg cursor-pointer border border-gray-700 transition-colors">
+              <Upload size={16} className="text-indigo-400" />
+              <span className="text-sm font-medium">{t.import}</span>
+              <input type="file" accept="audio/*,.m4a" onChange={handleImport} className="hidden" />
+            </label>
+            <button onClick={handleExport} disabled={tracks.length === 0} className="flex items-center gap-2 px-3 py-2 bg-gray-800 hover:bg-gray-700 rounded-lg border border-gray-700 disabled:opacity-50">
+              <Download size={16} className="text-emerald-400" />
+              <span className="text-sm font-medium">{t.export}</span>
+            </button>
+          </div>
         </div>
+      </header>
 
-        {/* Main Content */}
-        <div className="bg-gray-900/50 backdrop-blur-sm rounded-3xl p-6 sm:p-8 border border-gray-800 shadow-2xl">
-          <DropZone 
-            onFileSelected={processFile} 
-            isProcessing={status === AnalyzeStatus.PROCESSING}
-            labels={{
-              idle: t.dropIdle,
-              processing: t.dropProcessing,
-              supports: t.supports
-            }}
-          />
+      {/* Main Workspace */}
+      <main className="flex-1 flex flex-col max-w-7xl mx-auto w-full p-4 gap-6">
+        
+        {errorMessage && (
+          <div className="bg-red-900/30 border border-red-800 text-red-200 p-3 rounded-lg flex items-center gap-2">
+            <AlertCircle size={18} />
+            <span>{errorMessage}</span>
+            <button onClick={() => setErrorMessage(null)} className="ml-auto text-sm hover:underline">{t.close}</button>
+          </div>
+        )}
 
-          {/* Error Message */}
-          {status === AnalyzeStatus.ERROR && (
-            <div className="mt-6 p-4 bg-red-900/20 border border-red-800 rounded-xl flex items-center gap-3 text-red-200">
-              <AlertCircle className="w-5 h-5 shrink-0" />
-              <p>{errorMsg || t.error}</p>
-            </div>
-          )}
-
-          {/* Results Area */}
-          {status === AnalyzeStatus.COMPLETE && metadata && (
-            <div className="mt-8 space-y-8 animate-in fade-in slide-in-from-bottom-4 duration-500">
+        {/* Toolbar */}
+        <div className="flex items-center justify-between bg-gray-900/50 p-3 rounded-xl border border-gray-800">
+           <div className="flex items-center gap-4">
+              <span className="text-xs font-bold text-gray-500 uppercase tracking-wider px-2">{t.tracks} ({tracks.length})</span>
               
-              {/* Waveform Visual */}
-              <div className="space-y-2">
-                <div className="flex items-center justify-between text-sm text-gray-400 uppercase tracking-wider font-semibold">
-                  <span>{t.waveform}</span>
-                  <span>{formatDuration(metadata.duration)}</span>
-                </div>
-                <Waveform audioBuffer={audioBuffer} />
-              </div>
+              {/* Vertical Scale Toggle */}
+              <button 
+                onClick={() => setEditorState(s => ({ ...s, verticalScale: s.verticalScale === 'linear' ? 'db' : 'linear' }))}
+                className="flex items-center gap-2 px-3 py-1 bg-gray-800 border border-gray-700 rounded text-xs text-gray-300 hover:bg-gray-700"
+                title={t.dbTooltip}
+              >
+                <Ruler size={14} />
+                {editorState.verticalScale === 'linear' ? t.scaleLinear : t.scaleDb}
+              </button>
+           </div>
 
-              {/* Stats Grid */}
-              <div className="grid grid-cols-2 md:grid-cols-4 gap-4">
-                
-                {/* Sample Rate */}
-                <div className="bg-gray-800/50 p-4 rounded-xl border border-gray-700/50 hover:border-indigo-500/50 transition-colors">
-                  <div className="flex items-center gap-2 mb-2 text-indigo-400">
-                    <Activity className="w-4 h-4" />
-                    <span className="text-xs font-bold uppercase tracking-wider">{t.sampleRate}</span>
-                  </div>
-                  <div className="text-2xl font-mono font-bold text-white">
-                    {metadata.sampleRate.toLocaleString()} <span className="text-sm text-gray-500 font-sans">Hz</span>
-                  </div>
-                </div>
+           <div className="flex items-center gap-2">
+              <span className="text-xs font-bold text-gray-500 uppercase tracking-wider mr-2">{t.geminiAction}</span>
+              <button onClick={() => handleAiAction('transcribe')} disabled={tracks.length === 0 || isProcessing} className="flex items-center gap-2 px-3 py-1.5 bg-gradient-to-r from-blue-600 to-indigo-600 hover:from-blue-500 hover:to-indigo-500 text-white rounded-lg disabled:opacity-50 transition-all">
+                {isProcessing ? <div className="w-4 h-4 border-2 border-white/30 border-t-white rounded-full animate-spin" /> : <Sparkles size={14} />}
+                <span className="text-sm font-medium">{t.transcribe}</span>
+              </button>
+              <button onClick={() => handleAiAction('summarize')} disabled={tracks.length === 0 || isProcessing} className="flex items-center gap-2 px-3 py-1.5 bg-gray-800 hover:bg-gray-700 text-indigo-300 border border-indigo-900/50 rounded-lg disabled:opacity-50 transition-colors">
+                <span className="text-sm font-medium">{t.summarize}</span>
+              </button>
+           </div>
+        </div>
 
-                {/* Bit Depth */}
-                <div className="bg-gray-800/50 p-4 rounded-xl border border-gray-700/50 hover:border-indigo-500/50 transition-colors relative overflow-hidden">
-                  {metadata.isLossless && (
-                     <div className="absolute top-0 right-0 p-1">
-                       <div className="w-1.5 h-1.5 bg-green-500 rounded-full shadow-[0_0_8px_rgba(34,197,94,0.6)]"></div>
-                     </div>
-                  )}
-                  <div className="flex items-center gap-2 mb-2 text-purple-400">
-                    <Mic2 className="w-4 h-4" />
-                    <span className="text-xs font-bold uppercase tracking-wider">{t.bitDepth}</span>
-                  </div>
-                  <div className="text-2xl font-mono font-bold text-white truncate text-ellipsis" title={String(getBitDepthLabel(metadata.detectedBitDepth))}>
-                    {getBitDepthLabel(metadata.detectedBitDepth)}
-                  </div>
-                </div>
-
-                {/* Channels */}
-                <div className="bg-gray-800/50 p-4 rounded-xl border border-gray-700/50 hover:border-indigo-500/50 transition-colors">
-                  <div className="flex items-center gap-2 mb-2 text-blue-400">
-                    <Info className="w-4 h-4" />
-                    <span className="text-xs font-bold uppercase tracking-wider">{t.channels}</span>
-                  </div>
-                  <div className="text-2xl font-mono font-bold text-white">
-                    {metadata.channels} <span className="text-sm text-gray-500 font-sans">
-                      ({getChannelLabel(metadata.channels)})
-                    </span>
-                  </div>
-                </div>
-
-                {/* Bitrate */}
-                <div className="bg-gray-800/50 p-4 rounded-xl border border-gray-700/50 hover:border-indigo-500/50 transition-colors">
-                  <div className="flex items-center gap-2 mb-2 text-emerald-400">
-                    <FileAudio className="w-4 h-4" />
-                    <span className="text-xs font-bold uppercase tracking-wider">{t.bitrate}</span>
-                  </div>
-                  <div className="text-2xl font-mono font-bold text-white">
-                    {metadata.bitrate} <span className="text-sm text-gray-500 font-sans">{t.kbps}</span>
-                  </div>
-                </div>
-              </div>
-
-              {/* Detailed Metadata Table */}
-              <div className="overflow-hidden rounded-xl border border-gray-800 bg-gray-900">
-                <div className="px-6 py-4 border-b border-gray-800 bg-gray-800/30 flex items-center gap-2">
-                  <CheckCircle2 className="w-5 h-5 text-gray-400" />
-                  <h3 className="text-sm font-semibold text-gray-200">{t.fileMeta}</h3>
-                </div>
-                <div className="divide-y divide-gray-800">
-                  <div className="grid grid-cols-2 px-6 py-3 hover:bg-gray-800/20">
-                    <span className="text-sm text-gray-500">{t.fileName}</span>
-                    <span className="text-sm font-mono text-gray-300 text-right truncate pl-4">{metadata.fileName}</span>
-                  </div>
-                  <div className="grid grid-cols-2 px-6 py-3 hover:bg-gray-800/20">
-                    <span className="text-sm text-gray-500">{t.fileSize}</span>
-                    <span className="text-sm font-mono text-gray-300 text-right">{formatBytes(metadata.fileSize)}</span>
-                  </div>
-                  <div className="grid grid-cols-2 px-6 py-3 hover:bg-gray-800/20">
-                    <span className="text-sm text-gray-500">{t.mimeType}</span>
-                    <span className="text-sm font-mono text-gray-300 text-right">{metadata.format}</span>
-                  </div>
-                </div>
-              </div>
-
-              <p className="text-xs text-center text-gray-600 italic">
-                {t.note}
-              </p>
-
+        {/* Tracks Area */}
+        <div className="flex-1 bg-gray-900/30 rounded-2xl border border-gray-800/50 p-4 min-h-[400px] overflow-y-auto relative scrollbar-thin scrollbar-thumb-gray-700 scrollbar-track-transparent">
+          {tracks.length === 0 ? (
+            <div className="absolute inset-0 flex flex-col items-center justify-center text-gray-500 gap-4">
+               <div className="w-16 h-16 bg-gray-800 rounded-full flex items-center justify-center">
+                 <Plus size={32} className="text-gray-600" />
+               </div>
+               <p>{t.noTracks}</p>
+            </div>
+          ) : (
+            <div className="space-y-4">
+              {tracks.map(track => (
+                <TrackItem 
+                  key={track.id} 
+                  track={track} 
+                  duration={editorState.duration}
+                  verticalScale={editorState.verticalScale}
+                  onUpdate={(id, u) => setTracks(p => p.map(t => t.id === id ? {...t, ...u} : t))}
+                  onDelete={(id) => {
+                     setTracks(prev => {
+                       const next = prev.filter(t => t.id !== id);
+                       if(next.length===0) setEditorState(s=>({...s, isPlaying:false, currentTime:0}));
+                       else updateDuration(next);
+                       return next;
+                     })
+                  }}
+                />
+              ))}
             </div>
           )}
+          
+          {/* Playhead */}
+          {tracks.length > 0 && (
+            <div 
+               className="absolute top-0 bottom-0 w-0.5 bg-red-500 z-10 pointer-events-none mix-blend-screen shadow-[0_0_4px_rgba(239,68,68,0.8)]"
+               style={{ 
+                 // Simple positioning calc: 1rem (padding) + 14rem (controls) + 2.5rem (ruler) + time ratio
+                 // Controls width: w-56 (14rem) = 224px. Ruler w-10 = 40px. Padding 16px. Border 1px.
+                 // Total offset approx 282px.
+                 left: `calc(16px + 224px + 1px + 40px + 1px + ${(editorState.currentTime / editorState.duration) * 1000}px)` 
+               }} 
+            />
+          )}
         </div>
-      </div>
+
+        {/* AI Results */}
+        {aiResult && (
+          <div className="bg-gray-900 border border-gray-800 rounded-xl p-6 animate-in slide-in-from-bottom-4 duration-300 shadow-2xl">
+             <div className="flex items-center justify-between mb-4 border-b border-gray-800 pb-2">
+               <h3 className="text-lg font-bold text-white flex items-center gap-2">
+                 <Sparkles className="text-indigo-400" size={20} />
+                 {t.aiResult}
+               </h3>
+               <button onClick={() => setAiResult(null)} className="text-gray-500 hover:text-white">{t.close}</button>
+             </div>
+             <div className="prose prose-invert max-w-none max-h-64 overflow-y-auto">
+                {aiResult.type === 'transcription' ? (
+                  <p className="whitespace-pre-wrap text-gray-300 leading-relaxed">{aiResult.transcription}</p>
+                ) : (
+                  <div className="text-gray-300 whitespace-pre-wrap">{aiResult.summary}</div>
+                )}
+             </div>
+          </div>
+        )}
+      </main>
+
+      {/* Status Bar */}
+      <footer className="bg-gray-950 border-t border-gray-800 py-2 px-4 text-xs text-gray-500 flex justify-between items-center">
+        <div className="flex items-center gap-2">
+          <Cpu size={12} />
+          <span>{t.internalFormat}</span>
+        </div>
+        <div>v1.0.0 (Client-Side)</div>
+      </footer>
     </div>
   );
 }
