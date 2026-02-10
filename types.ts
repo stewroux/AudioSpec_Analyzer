@@ -29,6 +29,7 @@ export interface EditorState {
   currentTime: number; // in seconds
   duration: number; // max duration in seconds
   zoom: number; // pixels per second
+  scrollX: number; // scroll offset in seconds
   verticalScale: 'linear' | 'db'; // Vertical axis mode
 }
 

@@ -1,11 +1,12 @@
-import React, { useState, useRef, useCallback } from 'react';
+import React, { useState, useRef, useCallback, useEffect } from 'react';
 import { translations, Language } from './utils/i18n';
 import { Track, EditorState, AiAnalysisResult } from './types';
 import { getAudioContext, decodeAudio, mixTracks, bufferToWav } from './utils/audioEditor';
 import { analyzeAudioWithGemini } from './utils/geminiClient';
 import { parseWavHeader, detectM4aCodec, parseM4aHeader, estimateBitrate, detectBitDepthFromBuffer } from './utils/audioParser';
 import { TrackItem } from './components/TrackItem';
-import { Play, Pause, Square, Mic, Upload, Download, Sparkles, AlertCircle, Globe, Plus, Cpu, Ruler } from 'lucide-react';
+import { SpectrumAnalyzer } from './components/SpectrumAnalyzer';
+import { Play, Pause, Square, Mic, Upload, Download, Sparkles, AlertCircle, Globe, Plus, Cpu, Ruler, ZoomIn, ZoomOut, MoveHorizontal } from 'lucide-react';
 
 export default function App() {
   const [lang, setLang] = useState<Language>('ja');
@@ -17,7 +18,8 @@ export default function App() {
     isPlaying: false,
     currentTime: 0,
     duration: 10,
-    zoom: 100,
+    zoom: 50, // pixels per second (initial zoom)
+    scrollX: 0, // seconds
     verticalScale: 'linear'
   });
   const [isProcessing, setIsProcessing] = useState(false);
@@ -26,14 +28,22 @@ export default function App() {
 
   // Audio Context Refs
   const audioContextRef = useRef<AudioContext | null>(null);
+  const analyserRef = useRef<AnalyserNode | null>(null); // For visualization
   const sourceNodesRef = useRef<AudioBufferSourceNode[]>([]);
   const startTimeRef = useRef<number>(0);
   const animationFrameRef = useRef<number>(0);
   const mediaRecorderRef = useRef<MediaRecorder | null>(null);
+  const tracksContainerRef = useRef<HTMLDivElement>(null);
 
   const initAudioContext = () => {
     if (!audioContextRef.current) {
-      audioContextRef.current = getAudioContext();
+      const ctx = getAudioContext();
+      audioContextRef.current = ctx;
+      
+      // Setup Analyser
+      const analyser = ctx.createAnalyser();
+      analyser.fftSize = 2048;
+      analyserRef.current = analyser;
     }
     if (audioContextRef.current.state === 'suspended') {
       audioContextRef.current.resume();
@@ -46,7 +56,44 @@ export default function App() {
     setEditorState(prev => ({ ...prev, duration: Math.max(10, maxDur) }));
   }, []);
 
-  // --- Import Logic with Bit Depth & Bitrate Detection ---
+  // --- Zoom & Scroll Handlers ---
+  const handleZoom = (direction: 'in' | 'out') => {
+    setEditorState(prev => {
+      const newZoom = direction === 'in' ? prev.zoom * 1.2 : prev.zoom / 1.2;
+      return { ...prev, zoom: Math.max(10, Math.min(newZoom, 1000)) };
+    });
+  };
+
+  const handleWheel = useCallback((e: WheelEvent) => {
+    if (e.ctrlKey) {
+      e.preventDefault();
+      handleZoom(e.deltaY < 0 ? 'in' : 'out');
+    } else {
+      // Horizontal scroll with wheel
+      // e.deltaY is usually vertical scroll, mapping it to horizontal time scroll
+      if (Math.abs(e.deltaY) > Math.abs(e.deltaX)) {
+        setEditorState(prev => {
+          const deltaSeconds = e.deltaY / prev.zoom;
+          const newScroll = Math.max(0, Math.min(prev.scrollX + deltaSeconds, prev.duration));
+          return { ...prev, scrollX: newScroll };
+        });
+      }
+    }
+  }, []);
+
+  // Attach wheel listener to tracks container
+  useEffect(() => {
+    const el = tracksContainerRef.current;
+    if (el) {
+      el.addEventListener('wheel', handleWheel, { passive: false });
+    }
+    return () => {
+      if (el) el.removeEventListener('wheel', handleWheel);
+    };
+  }, [handleWheel]);
+
+
+  // --- Import Logic ---
   const handleImport = async (e: React.ChangeEvent<HTMLInputElement>) => {
     const file = e.target.files?.[0];
     if (!file) return;
@@ -56,7 +103,6 @@ export default function App() {
       initAudioContext();
       if (!audioContextRef.current) throw new Error("AudioContext init failed");
 
-      // 1. Detect Bit Depth & Sample Rate from original file before decoding
       const arrayBuffer = await file.arrayBuffer();
       let detectedWavInfo: { bitDepth: number, sampleRate: number } | null = null;
       let detectedM4aInfo: { sampleRate: number, codec: string } | null = null;
@@ -67,63 +113,37 @@ export default function App() {
       if (lowerName.endsWith('.wav')) {
         detectedWavInfo = parseWavHeader(arrayBuffer);
       } else if (lowerName.match(/\.(m4a|mp4|aac)$/)) {
-        // Parse M4A atoms for Sample Rate
-        try {
-          detectedM4aInfo = parseM4aHeader(arrayBuffer);
-        } catch (e) { console.warn("M4A parse failed", e); }
-        
-        // Also get codec type (ALAC vs AAC) heuristically
+        try { detectedM4aInfo = parseM4aHeader(arrayBuffer); } catch (e) { console.warn(e); }
         m4aCodecInfo = detectM4aCodec(arrayBuffer);
       }
 
-      // 2. Decode for Web Audio (converts to 32-bit float internal, and resamples to context rate)
       const buffer = await audioContextRef.current.decodeAudioData(arrayBuffer.slice(0));
       
-      // 3. Determine Display Labels
       let bitDepthLabel = "Unknown";
       let bitrateLabel = "";
-      let displaySampleRate = buffer.sampleRate; // Default to context rate (fallback)
+      let displaySampleRate = buffer.sampleRate;
 
-      // Bitrate & Sample Rate Logic
       if (detectedWavInfo) {
-         // Exact for Linear PCM: SampleRate * Channels * Bits
          const kbps = Math.round((detectedWavInfo.sampleRate * buffer.numberOfChannels * detectedWavInfo.bitDepth) / 1000);
          bitrateLabel = `${kbps} kbps`;
-         displaySampleRate = detectedWavInfo.sampleRate; // Use original rate from header
+         displaySampleRate = detectedWavInfo.sampleRate;
       } else {
-         // Approx for others: (Size * 8) / Duration
          const kbps = estimateBitrate(file.size, buffer.duration);
          bitrateLabel = `~${kbps} kbps`;
-         
-         if (detectedM4aInfo) {
-           displaySampleRate = detectedM4aInfo.sampleRate;
-         }
+         if (detectedM4aInfo) displaySampleRate = detectedM4aInfo.sampleRate;
       }
 
-      // Bit Depth / Format Label Generation
       if (detectedWavInfo) {
         bitDepthLabel = `${detectedWavInfo.bitDepth}-bit PCM`;
       } else {
-        // Fallback: Analyze decoded buffer to estimate bit depth
         const estimatedBits = detectBitDepthFromBuffer(buffer);
         const estString = estimatedBits === 32 ? "32-bit Float" : `${estimatedBits}-bit`;
-
-        if (lowerName.endsWith('.flac')) {
-          bitDepthLabel = `FLAC (${estString})`;
-        } else if (lowerName.match(/\.(m4a|mp4|aac)$/)) {
-           // Combine header info and heuristic info
+        if (lowerName.endsWith('.flac')) bitDepthLabel = `FLAC (${estString})`;
+        else if (lowerName.match(/\.(m4a|mp4|aac)$/)) {
            const codecName = m4aCodecInfo?.codec || detectedM4aInfo?.codec || "M4A";
            bitDepthLabel = `${codecName} (${estString})`;
-        } else if (lowerName.endsWith('.mp3')) {
-          bitDepthLabel = `MP3 (${estString})`;
-        } else if (lowerName.endsWith('.ogg')) {
-          bitDepthLabel = `OGG (${estString})`;
-        } else if (lowerName.endsWith('.aiff') || lowerName.endsWith('.aif')) {
-          bitDepthLabel = `AIFF (${estString})`;
-        } else {
-          // Generic fallback
-          bitDepthLabel = `${estString} (Est.)`;
-        }
+        } else if (lowerName.endsWith('.mp3')) bitDepthLabel = `MP3 (${estString})`;
+        else bitDepthLabel = `${estString} (Est.)`;
       }
 
       const newTrack: Track = {
@@ -169,8 +189,6 @@ export default function App() {
         
         const arrayBuffer = await blob.arrayBuffer();
         const audioBuffer = await audioContextRef.current.decodeAudioData(arrayBuffer);
-
-        // Calculate approx bitrate for recording
         const kbps = estimateBitrate(blob.size, audioBuffer.duration);
 
         const newTrack: Track = {
@@ -182,7 +200,7 @@ export default function App() {
           isSolo: false,
           color: '#ef4444',
           originalBitDepth: "WebM / 32-bit Float",
-          originalSampleRate: audioBuffer.sampleRate, // Recording matches context
+          originalSampleRate: audioBuffer.sampleRate,
           bitrate: `~${kbps} kbps`
         };
 
@@ -197,9 +215,7 @@ export default function App() {
       recorder.start();
       mediaRecorderRef.current = recorder;
       setIsProcessing(true); 
-
     } catch (err) {
-      console.error(err);
       setErrorMessage(t.micError);
     }
   };
@@ -212,17 +228,31 @@ export default function App() {
     }
   };
 
-  const handlePlay = () => {
+  const handleSeek = (time: number) => {
+    setEditorState(prev => ({ ...prev, currentTime: time }));
+    if (editorState.isPlaying) {
+      handlePlay(time); // Restart from new time
+    }
+  };
+
+  const handlePlay = (startTimeOverride?: number) => {
     if (!audioContextRef.current || tracks.length === 0) return;
     initAudioContext();
-    if (editorState.isPlaying) handleStop();
+    if (editorState.isPlaying) handleStop(); // Stop existing before starting new
 
     const ctx = audioContextRef.current;
-    const startOffset = editorState.currentTime >= editorState.duration ? 0 : editorState.currentTime;
+    const startOffset = startTimeOverride !== undefined ? startTimeOverride : (editorState.currentTime >= editorState.duration ? 0 : editorState.currentTime);
     const sources: AudioBufferSourceNode[] = [];
 
     const soloActive = tracks.some(t => t.isSolo);
     const activeTracks = tracks.filter(t => soloActive ? t.isSolo : !t.isMuted);
+
+    // Master Gain for visualizer connection
+    const masterGain = ctx.createGain();
+    masterGain.connect(ctx.destination);
+    if (analyserRef.current) {
+      masterGain.connect(analyserRef.current);
+    }
 
     activeTracks.forEach(track => {
       const source = ctx.createBufferSource();
@@ -230,7 +260,7 @@ export default function App() {
       const gainNode = ctx.createGain();
       gainNode.gain.value = track.volume;
       source.connect(gainNode);
-      gainNode.connect(ctx.destination);
+      gainNode.connect(masterGain);
 
       if (startOffset < track.buffer.duration) {
         source.start(ctx.currentTime, startOffset);
@@ -241,25 +271,31 @@ export default function App() {
     sourceNodesRef.current = sources;
     startTimeRef.current = ctx.currentTime - startOffset;
     
-    setEditorState(prev => ({ ...prev, isPlaying: true }));
+    setEditorState(prev => ({ ...prev, isPlaying: true, currentTime: startOffset })); // Ensure state matches
 
     const draw = () => {
       const now = ctx.currentTime;
       const playbackTime = now - startTimeRef.current;
       
       if (playbackTime >= editorState.duration) {
-        // Auto-stop and reset to start
-        sourceNodesRef.current.forEach(node => {
-          try { node.stop(); } catch(e) {}
-        });
-        sourceNodesRef.current = [];
-        if (animationFrameRef.current) cancelAnimationFrame(animationFrameRef.current);
-        
+        handleStop();
         setEditorState(prev => ({ ...prev, isPlaying: false, currentTime: 0 }));
         return;
       }
       
-      setEditorState(prev => ({ ...prev, currentTime: playbackTime }));
+      setEditorState(prev => {
+        // Auto-scroll logic: if playback head hits right edge
+        const viewportWidth = tracksContainerRef.current?.clientWidth || 800;
+        const visibleDuration = (viewportWidth - 280) / prev.zoom; // 280 approx offset for sidebar
+        const relativeTime = playbackTime - prev.scrollX;
+        
+        let newScroll = prev.scrollX;
+        if (relativeTime > visibleDuration * 0.9) {
+           newScroll = playbackTime - (visibleDuration * 0.1);
+        }
+
+        return { ...prev, currentTime: playbackTime, scrollX: newScroll };
+      });
       animationFrameRef.current = requestAnimationFrame(draw);
     };
     animationFrameRef.current = requestAnimationFrame(draw);
@@ -307,181 +343,239 @@ export default function App() {
     }
   };
 
+  // Timeline Ruler Calculation
+  const renderTimeRuler = () => {
+    const ticks = [];
+    // Start from scrollX, go until scrollX + viewport
+    const viewportWidth = tracksContainerRef.current?.clientWidth || 1000;
+    // Sidebar width is roughly 224px (w-56) + 40px ruler + padding. Let's assume safe width.
+    const effectiveWidth = viewportWidth; 
+    
+    const startSec = Math.floor(editorState.scrollX);
+    const endSec = startSec + (effectiveWidth / editorState.zoom) + 1;
+
+    for (let s = startSec; s < endSec; s++) {
+      const left = (s - editorState.scrollX) * editorState.zoom;
+      if (left < 0) continue;
+      
+      ticks.push(
+        <div key={s} className="absolute top-0 bottom-0 border-l border-gray-700 select-none pointer-events-none" style={{ left: `${282 + left}px` }}>
+           <span className="absolute top-1 left-1 text-[10px] text-gray-500 font-mono">{new Date(s * 1000).toISOString().substr(14, 5)}</span>
+        </div>
+      );
+    }
+    return ticks;
+  };
+
   return (
-    <div className="min-h-screen bg-gray-950 text-gray-100 flex flex-col font-sans">
+    <div className="min-h-screen bg-gray-950 text-gray-100 flex flex-col font-sans overflow-hidden">
       
       {/* Top Bar */}
-      <header className="bg-gray-900 border-b border-gray-800 p-4 sticky top-0 z-50 shadow-md">
-        <div className="max-w-7xl mx-auto flex flex-col md:flex-row items-center justify-between gap-4">
-          <div className="flex items-center gap-4">
-            <h1 className="text-xl font-bold bg-clip-text text-transparent bg-gradient-to-r from-indigo-400 to-cyan-400">
-              {t.appTitle}
+      <header className="bg-gray-900 border-b border-gray-800 p-3 sticky top-0 z-50 shadow-md shrink-0">
+        <div className="max-w-full mx-4 flex items-center justify-between gap-4">
+          <div className="flex items-center gap-3">
+            <h1 className="text-lg font-bold bg-clip-text text-transparent bg-gradient-to-r from-indigo-400 to-cyan-400 tracking-tight">
+              AUDIO SPEC PRO
             </h1>
-            <button onClick={() => setLang(l => l === 'en' ? 'ja' : 'en')} className="p-2 text-gray-400 hover:text-white rounded-full hover:bg-gray-800">
-              <Globe size={18} />
+            <button onClick={() => setLang(l => l === 'en' ? 'ja' : 'en')} className="px-2 py-1 text-xs text-gray-500 border border-gray-700 rounded hover:text-white hover:bg-gray-800">
+              {lang.toUpperCase()}
             </button>
           </div>
 
-          <div className="flex items-center gap-2 bg-gray-800 p-2 rounded-xl border border-gray-700">
-             <button onClick={() => { handleStop(); setEditorState(p => ({...p, currentTime: 0})); }} className="p-2 hover:bg-gray-700 rounded-lg text-gray-300">
-                <Square size={20} fill="currentColor" />
+          <div className="flex items-center gap-2 bg-gray-950 p-1.5 rounded-lg border border-gray-800 shadow-inner">
+             <button onClick={() => { handleStop(); setEditorState(p => ({...p, currentTime: 0, scrollX: 0})); }} className="p-2 hover:bg-gray-800 rounded text-gray-400 hover:text-white transition-colors">
+                <Square size={16} fill="currentColor" />
              </button>
              
              {!editorState.isPlaying ? (
-               <button onClick={handlePlay} className="p-3 bg-indigo-600 hover:bg-indigo-500 text-white rounded-full shadow-lg">
-                 <Play size={24} fill="currentColor" className="ml-1" />
+               <button onClick={() => handlePlay()} className="p-2.5 bg-indigo-600 hover:bg-indigo-500 text-white rounded shadow-lg transition-all hover:scale-105 active:scale-95">
+                 <Play size={20} fill="currentColor" className="ml-0.5" />
                </button>
              ) : (
-               <button onClick={() => handleStop()} className="p-3 bg-yellow-600 hover:bg-yellow-500 text-white rounded-full shadow-lg">
-                 <Pause size={24} fill="currentColor" />
+               <button onClick={() => handleStop()} className="p-2.5 bg-yellow-500 hover:bg-yellow-400 text-black rounded shadow-lg transition-all active:scale-95">
+                 <Pause size={20} fill="currentColor" />
                </button>
              )}
 
-             <div className="w-px h-8 bg-gray-700 mx-2"></div>
+             <div className="w-px h-6 bg-gray-800 mx-2"></div>
 
              {mediaRecorderRef.current?.state === 'recording' ? (
-                <button onClick={handleStopRecord} className="flex items-center gap-2 px-3 py-2 bg-red-600 text-white rounded-lg animate-pulse">
-                   <Square size={16} fill="currentColor" />
-                   <span className="text-sm font-bold">REC</span>
+                <button onClick={handleStopRecord} className="flex items-center gap-2 px-3 py-1.5 bg-red-600 text-white rounded animate-pulse">
+                   <Square size={14} fill="currentColor" />
+                   <span className="text-xs font-bold tracking-wider">REC</span>
                 </button>
              ) : (
-               <button onClick={handleRecord} className="flex items-center gap-2 px-3 py-2 bg-gray-700 hover:bg-gray-600 text-red-400 rounded-lg">
-                 <Mic size={18} />
-                 <span className="text-sm">REC</span>
+               <button onClick={handleRecord} className="flex items-center gap-2 px-3 py-1.5 bg-gray-800 hover:bg-gray-700 text-red-400 rounded transition-colors group">
+                 <Mic size={16} className="group-hover:text-red-300" />
+                 <span className="text-xs font-bold tracking-wider group-hover:text-red-300">REC</span>
                </button>
              )}
           </div>
 
-          <div className="font-mono text-xl text-cyan-400 w-32 text-center bg-gray-900 py-1 rounded border border-gray-800">
-            {new Date(editorState.currentTime * 1000).toISOString().substr(14, 8)}
-          </div>
+          <div className="flex items-center gap-4">
+             <div className="font-mono text-xl text-cyan-400 tabular-nums tracking-widest bg-gray-950 px-4 py-1 rounded border border-gray-800 shadow-[0_0_10px_rgba(34,211,238,0.1)]">
+               {new Date(editorState.currentTime * 1000).toISOString().substr(14, 9)}
+             </div>
 
-          <div className="flex gap-2">
-            <label className="flex items-center gap-2 px-3 py-2 bg-gray-800 hover:bg-gray-700 rounded-lg cursor-pointer border border-gray-700 transition-colors">
-              <Upload size={16} className="text-indigo-400" />
-              <span className="text-sm font-medium">{t.import}</span>
-              <input type="file" accept="audio/*,.m4a" onChange={handleImport} className="hidden" />
-            </label>
-            <button onClick={handleExport} disabled={tracks.length === 0} className="flex items-center gap-2 px-3 py-2 bg-gray-800 hover:bg-gray-700 rounded-lg border border-gray-700 disabled:opacity-50">
-              <Download size={16} className="text-emerald-400" />
-              <span className="text-sm font-medium">{t.export}</span>
-            </button>
+             <div className="flex gap-2">
+                <label className="flex items-center gap-2 px-3 py-1.5 bg-gray-800 hover:bg-gray-700 rounded cursor-pointer border border-gray-700 transition-colors">
+                  <Upload size={14} className="text-indigo-400" />
+                  <span className="text-xs font-bold text-gray-300">{t.import}</span>
+                  <input type="file" accept="audio/*,.m4a" onChange={handleImport} className="hidden" />
+                </label>
+                <button onClick={handleExport} disabled={tracks.length === 0} className="flex items-center gap-2 px-3 py-1.5 bg-gray-800 hover:bg-gray-700 rounded border border-gray-700 disabled:opacity-50 transition-colors">
+                  <Download size={14} className="text-emerald-400" />
+                  <span className="text-xs font-bold text-gray-300">{t.export}</span>
+                </button>
+             </div>
           </div>
         </div>
       </header>
 
-      {/* Main Workspace */}
-      <main className="flex-1 flex flex-col max-w-7xl mx-auto w-full p-4 gap-6">
-        
-        {errorMessage && (
-          <div className="bg-red-900/30 border border-red-800 text-red-200 p-3 rounded-lg flex items-center gap-2">
-            <AlertCircle size={18} />
-            <span>{errorMessage}</span>
-            <button onClick={() => setErrorMessage(null)} className="ml-auto text-sm hover:underline">{t.close}</button>
-          </div>
-        )}
+      {/* Visualizer Panel */}
+      <SpectrumAnalyzer analyser={analyserRef.current} isPlaying={editorState.isPlaying} />
 
-        {/* Toolbar */}
-        <div className="flex items-center justify-between bg-gray-900/50 p-3 rounded-xl border border-gray-800">
-           <div className="flex items-center gap-4">
-              <span className="text-xs font-bold text-gray-500 uppercase tracking-wider px-2">{t.tracks} ({tracks.length})</span>
+      {/* Main Workspace */}
+      <main className="flex-1 flex flex-col w-full overflow-hidden relative">
+        
+        {/* Toolbar & HUD */}
+        <div className="flex items-center justify-between p-2 bg-gray-900 border-b border-gray-800">
+           <div className="flex items-center gap-2">
+              <span className="text-[10px] font-bold text-gray-500 uppercase px-2 border-r border-gray-700">Display</span>
               
-              {/* Vertical Scale Toggle */}
               <button 
                 onClick={() => setEditorState(s => ({ ...s, verticalScale: s.verticalScale === 'linear' ? 'db' : 'linear' }))}
-                className="flex items-center gap-2 px-3 py-1 bg-gray-800 border border-gray-700 rounded text-xs text-gray-300 hover:bg-gray-700"
+                className="flex items-center gap-1 px-2 py-1 bg-gray-800 hover:bg-gray-700 rounded text-[10px] text-gray-300 transition-colors"
                 title={t.dbTooltip}
               >
-                <Ruler size={14} />
+                <Ruler size={12} />
                 {editorState.verticalScale === 'linear' ? t.scaleLinear : t.scaleDb}
               </button>
+
+              <div className="w-px h-4 bg-gray-700 mx-1"></div>
+
+              <button onClick={() => handleZoom('out')} className="p-1 hover:bg-gray-700 rounded text-gray-400"><ZoomOut size={14} /></button>
+              <div className="flex items-center gap-1 px-2 min-w-[60px] justify-center">
+                 <span className="text-[10px] text-gray-400">ZOOM</span>
+                 <span className="text-[10px] text-cyan-400 font-mono">{Math.round(editorState.zoom)}%</span>
+              </div>
+              <button onClick={() => handleZoom('in')} className="p-1 hover:bg-gray-700 rounded text-gray-400"><ZoomIn size={14} /></button>
            </div>
 
            <div className="flex items-center gap-2">
-              <span className="text-xs font-bold text-gray-500 uppercase tracking-wider mr-2">{t.geminiAction}</span>
-              <button onClick={() => handleAiAction('transcribe')} disabled={tracks.length === 0 || isProcessing} className="flex items-center gap-2 px-3 py-1.5 bg-gradient-to-r from-blue-600 to-indigo-600 hover:from-blue-500 hover:to-indigo-500 text-white rounded-lg disabled:opacity-50 transition-all">
-                {isProcessing ? <div className="w-4 h-4 border-2 border-white/30 border-t-white rounded-full animate-spin" /> : <Sparkles size={14} />}
-                <span className="text-sm font-medium">{t.transcribe}</span>
+              <span className="text-[10px] font-bold text-gray-500 uppercase px-2">Gemini AI Tools</span>
+              <button onClick={() => handleAiAction('transcribe')} disabled={tracks.length === 0 || isProcessing} className="flex items-center gap-1.5 px-3 py-1 bg-indigo-900/50 hover:bg-indigo-900 border border-indigo-700/50 text-indigo-200 rounded text-xs disabled:opacity-50 transition-all">
+                {isProcessing ? <div className="w-3 h-3 border-2 border-white/30 border-t-white rounded-full animate-spin" /> : <Sparkles size={12} />}
+                <span>{t.transcribe}</span>
               </button>
-              <button onClick={() => handleAiAction('summarize')} disabled={tracks.length === 0 || isProcessing} className="flex items-center gap-2 px-3 py-1.5 bg-gray-800 hover:bg-gray-700 text-indigo-300 border border-indigo-900/50 rounded-lg disabled:opacity-50 transition-colors">
-                <span className="text-sm font-medium">{t.summarize}</span>
+              <button onClick={() => handleAiAction('summarize')} disabled={tracks.length === 0 || isProcessing} className="flex items-center gap-1.5 px-3 py-1 bg-gray-800 hover:bg-gray-700 border border-gray-600 text-gray-300 rounded text-xs disabled:opacity-50 transition-colors">
+                <span>{t.summarize}</span>
               </button>
            </div>
         </div>
 
-        {/* Tracks Area */}
-        <div className="flex-1 bg-gray-900/30 rounded-2xl border border-gray-800/50 p-4 min-h-[400px] overflow-y-auto relative scrollbar-thin scrollbar-thumb-gray-700 scrollbar-track-transparent">
-          {tracks.length === 0 ? (
-            <div className="absolute inset-0 flex flex-col items-center justify-center text-gray-500 gap-4">
-               <div className="w-16 h-16 bg-gray-800 rounded-full flex items-center justify-center">
-                 <Plus size={32} className="text-gray-600" />
-               </div>
-               <p>{t.noTracks}</p>
-            </div>
-          ) : (
-            <div className="space-y-4">
-              {tracks.map(track => (
-                <TrackItem 
-                  key={track.id} 
-                  track={track} 
-                  duration={editorState.duration}
-                  verticalScale={editorState.verticalScale}
-                  onUpdate={(id, u) => setTracks(p => p.map(t => t.id === id ? {...t, ...u} : t))}
-                  onDelete={(id) => {
-                     setTracks(prev => {
-                       const next = prev.filter(t => t.id !== id);
-                       if(next.length===0) setEditorState(s=>({...s, isPlaying:false, currentTime:0}));
-                       else updateDuration(next);
-                       return next;
-                     })
-                  }}
-                />
-              ))}
-            </div>
-          )}
+        {errorMessage && (
+          <div className="absolute top-2 right-2 z-50 bg-red-950/90 border border-red-500/50 text-red-200 px-4 py-2 rounded shadow-xl flex items-center gap-2 backdrop-blur-sm animate-in fade-in slide-in-from-top-2">
+            <AlertCircle size={16} />
+            <span className="text-sm">{errorMessage}</span>
+            <button onClick={() => setErrorMessage(null)} className="ml-2 font-bold hover:text-white">×</button>
+          </div>
+        )}
+
+        {/* Tracks Scroll Area */}
+        <div ref={tracksContainerRef} className="flex-1 overflow-y-auto overflow-x-hidden relative bg-gray-950 custom-scrollbar">
           
-          {/* Playhead */}
+          {/* Time Ruler (Fixed to Background) */}
+          <div className="sticky top-0 h-6 bg-gray-900 border-b border-gray-800 z-20 flex items-center shadow-sm">
+             <div className="w-[282px] shrink-0 border-r border-gray-800 h-full flex items-center px-2 bg-gray-900 z-30">
+                <span className="text-[10px] text-gray-500 font-mono">TIMELINE</span>
+             </div>
+             <div className="flex-1 relative h-full">
+                {renderTimeRuler()}
+             </div>
+          </div>
+
+          <div className="p-4 space-y-2 pb-32">
+            {tracks.length === 0 && (
+              <div className="flex flex-col items-center justify-center py-20 text-gray-600 gap-4 opacity-50">
+                <div className="w-20 h-20 border-2 border-dashed border-gray-700 rounded-2xl flex items-center justify-center">
+                  <Plus size={32} />
+                </div>
+                <p className="font-mono text-sm">{t.noTracks}</p>
+              </div>
+            )}
+            
+            {tracks.map(track => (
+              <TrackItem 
+                key={track.id} 
+                track={track} 
+                duration={editorState.duration}
+                verticalScale={editorState.verticalScale}
+                zoom={editorState.zoom}
+                scrollX={editorState.scrollX}
+                onUpdate={(id, u) => setTracks(p => p.map(t => t.id === id ? {...t, ...u} : t))}
+                onDelete={(id) => {
+                   setTracks(prev => {
+                     const next = prev.filter(t => t.id !== id);
+                     if(next.length===0) setEditorState(s=>({...s, isPlaying:false, currentTime:0}));
+                     else updateDuration(next);
+                     return next;
+                   })
+                }}
+                onSeek={handleSeek}
+              />
+            ))}
+          </div>
+          
+          {/* Playhead Line */}
           {tracks.length > 0 && (
-            <div 
-               className="absolute top-0 bottom-0 w-0.5 bg-red-500 z-10 pointer-events-none mix-blend-screen shadow-[0_0_4px_rgba(239,68,68,0.8)]"
+             <div 
+               className="absolute top-6 bottom-0 w-px bg-red-500 z-10 pointer-events-none mix-blend-screen"
                style={{ 
-                 // Simple positioning calc: 1rem (padding) + 14rem (controls) + 2.5rem (ruler) + time ratio
-                 // Controls width: w-56 (14rem) = 224px. Ruler w-10 = 40px. Padding 16px. Border 1px.
-                 // Total offset approx 282px.
-                 left: `calc(16px + 224px + 1px + 40px + 1px + ${(editorState.currentTime / editorState.duration) * 1000}px)` 
+                 left: `${282 + (editorState.currentTime - editorState.scrollX) * editorState.zoom}px`,
+                 display: (editorState.currentTime < editorState.scrollX) ? 'none' : 'block'
                }} 
-            />
+             >
+                <div className="w-3 h-3 -ml-1.5 bg-red-500 transform rotate-45 -mt-1.5 shadow-[0_0_5px_rgba(239,68,68,1)]"></div>
+             </div>
           )}
+
         </div>
 
-        {/* AI Results */}
+        {/* AI Results Overlay */}
         {aiResult && (
-          <div className="bg-gray-900 border border-gray-800 rounded-xl p-6 animate-in slide-in-from-bottom-4 duration-300 shadow-2xl">
-             <div className="flex items-center justify-between mb-4 border-b border-gray-800 pb-2">
-               <h3 className="text-lg font-bold text-white flex items-center gap-2">
-                 <Sparkles className="text-indigo-400" size={20} />
-                 {t.aiResult}
+          <div className="absolute bottom-8 right-8 w-96 max-h-[50%] bg-gray-900/95 border border-indigo-500/30 rounded-lg shadow-2xl backdrop-blur-md flex flex-col z-50 animate-in slide-in-from-bottom-10 fade-in duration-300">
+             <div className="flex items-center justify-between p-3 border-b border-gray-800 bg-indigo-950/20">
+               <h3 className="text-sm font-bold text-indigo-300 flex items-center gap-2">
+                 <Sparkles size={14} />
+                 GEMINI ANALYSIS
                </h3>
-               <button onClick={() => setAiResult(null)} className="text-gray-500 hover:text-white">{t.close}</button>
+               <button onClick={() => setAiResult(null)} className="text-gray-400 hover:text-white">×</button>
              </div>
-             <div className="prose prose-invert max-w-none max-h-64 overflow-y-auto">
+             <div className="p-4 overflow-y-auto custom-scrollbar text-sm leading-relaxed text-gray-300">
                 {aiResult.type === 'transcription' ? (
-                  <p className="whitespace-pre-wrap text-gray-300 leading-relaxed">{aiResult.transcription}</p>
+                  <p className="whitespace-pre-wrap">{aiResult.transcription}</p>
                 ) : (
-                  <div className="text-gray-300 whitespace-pre-wrap">{aiResult.summary}</div>
+                  <div className="whitespace-pre-wrap">{aiResult.summary}</div>
                 )}
              </div>
           </div>
         )}
       </main>
 
-      {/* Status Bar */}
-      <footer className="bg-gray-950 border-t border-gray-800 py-2 px-4 text-xs text-gray-500 flex justify-between items-center">
-        <div className="flex items-center gap-2">
-          <Cpu size={12} />
-          <span>{t.internalFormat}</span>
+      {/* Footer */}
+      <footer className="bg-gray-950 border-t border-gray-800 py-1 px-4 text-[10px] text-gray-600 flex justify-between items-center shrink-0 h-6">
+        <div className="flex items-center gap-4">
+           <div className="flex items-center gap-1">
+             <Cpu size={10} />
+             <span>ENGINE: 32-BIT FLOAT</span>
+           </div>
+           <div className="flex items-center gap-1">
+             <MoveHorizontal size={10} />
+             <span>SCROLL: {editorState.scrollX.toFixed(2)}s</span>
+           </div>
         </div>
-        <div>v1.0.0 (Client-Side)</div>
+        <div>AUDIO SPEC PRO v2.0</div>
       </footer>
     </div>
   );
