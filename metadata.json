@@ -1,0 +1,5 @@
+{
+  "name": "AudioSpec Analyzer",
+  "description": "Professional audio analysis tool to detect sample rate, bit depth, and bitrate directly in your browser.",
+  "requestFramePermissions": []
+}
