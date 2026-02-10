@@ -7,9 +7,45 @@ export const getAudioContext = (): AudioContext => {
   return ctx;
 };
 
+// Robust file reading helper with multiple strategies
+export const readFileAsArrayBuffer = async (blob: Blob): Promise<ArrayBuffer> => {
+  // Strategy 1: Response API (Most Robust for memory/permissions)
+  // This avoids reading the entire file into a FileReader string buffer first.
+  try {
+    return await new Response(blob).arrayBuffer();
+  } catch (e) {
+    console.warn("Response API strategy failed, falling back to FileReader", e);
+  }
+
+  // Strategy 2: FileReader (Fallback)
+  return new Promise((resolve, reject) => {
+    const reader = new FileReader();
+    
+    reader.onload = () => {
+      if (reader.result instanceof ArrayBuffer) {
+        resolve(reader.result);
+      } else {
+        reject(new Error("Result is not an ArrayBuffer"));
+      }
+    };
+    
+    reader.onerror = () => {
+      const msg = reader.error?.message || 'Unknown FileReader error';
+      reject(new Error(`File read failed: ${msg}`));
+    };
+    
+    try {
+        reader.readAsArrayBuffer(blob);
+    } catch (e: any) {
+        reject(new Error(`Failed to initiate file read: ${e.message}`));
+    }
+  });
+};
+
 export const decodeAudio = async (file: File, context: AudioContext): Promise<AudioBuffer> => {
-  const arrayBuffer = await file.arrayBuffer();
-  return await context.decodeAudioData(arrayBuffer);
+  const arrayBuffer = await readFileAsArrayBuffer(file);
+  // Decode a copy to prevent buffer detaching issues if the arrayBuffer is reused
+  return await context.decodeAudioData(arrayBuffer.slice(0));
 };
 
 export const bufferToWav = (buffer: AudioBuffer): Blob => {
@@ -83,6 +119,8 @@ export const mixTracks = (
   const activeTracks = soloTracks.length > 0 ? soloTracks : tracks.filter(t => !t.isMuted);
 
   for (const track of activeTracks) {
+    if (track.isAnalysisOnly) continue; // Skip large files that aren't loaded
+
     const trackBuffer = track.buffer;
     const trackLen = Math.min(length, trackBuffer.length);
     

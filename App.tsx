@@ -1,12 +1,16 @@
 import React, { useState, useRef, useCallback, useEffect } from 'react';
 import { translations, Language } from './utils/i18n';
 import { Track, EditorState, AiAnalysisResult } from './types';
-import { getAudioContext, decodeAudio, mixTracks, bufferToWav } from './utils/audioEditor';
+import { getAudioContext, decodeAudio, mixTracks, bufferToWav, readFileAsArrayBuffer } from './utils/audioEditor';
 import { analyzeAudioWithGemini } from './utils/geminiClient';
-import { parseWavHeader, detectM4aCodec, parseM4aHeader, estimateBitrate, detectBitDepthFromBuffer } from './utils/audioParser';
+import { parseWavHeader, detectM4aCodec, parseM4aHeader, estimateBitrate, detectBitDepthFromBuffer, formatBytes } from './utils/audioParser';
+import { removeSilence, applyDenoise, applySmartGate } from './utils/audioEffects';
 import { TrackItem } from './components/TrackItem';
 import { SpectrumAnalyzer } from './components/SpectrumAnalyzer';
-import { Play, Pause, Square, Mic, Upload, Download, Sparkles, AlertCircle, Globe, Plus, Cpu, Ruler, ZoomIn, ZoomOut, MoveHorizontal } from 'lucide-react';
+import { Play, Pause, Square, Mic, Upload, Download, Sparkles, AlertCircle, Globe, Plus, Cpu, Ruler, ZoomIn, ZoomOut, MoveHorizontal, CheckCircle2 } from 'lucide-react';
+
+// Limit for full playback support (1GB). Files larger than this will be "Analysis Only".
+const MAX_PLAYBACK_SIZE_BYTES = 1024 * 1024 * 1024; 
 
 export default function App() {
   const [lang, setLang] = useState<Language>('ja');
@@ -18,17 +22,18 @@ export default function App() {
     isPlaying: false,
     currentTime: 0,
     duration: 10,
-    zoom: 50, // pixels per second (initial zoom)
+    zoom: 50, // pixels per second
     scrollX: 0, // seconds
     verticalScale: 'linear'
   });
   const [isProcessing, setIsProcessing] = useState(false);
+  const [processingMessage, setProcessingMessage] = useState<string | null>(null);
   const [aiResult, setAiResult] = useState<AiAnalysisResult | null>(null);
   const [errorMessage, setErrorMessage] = useState<string | null>(null);
 
   // Audio Context Refs
   const audioContextRef = useRef<AudioContext | null>(null);
-  const analyserRef = useRef<AnalyserNode | null>(null); // For visualization
+  const analyserRef = useRef<AnalyserNode | null>(null); 
   const sourceNodesRef = useRef<AudioBufferSourceNode[]>([]);
   const startTimeRef = useRef<number>(0);
   const animationFrameRef = useRef<number>(0);
@@ -39,8 +44,6 @@ export default function App() {
     if (!audioContextRef.current) {
       const ctx = getAudioContext();
       audioContextRef.current = ctx;
-      
-      // Setup Analyser
       const analyser = ctx.createAnalyser();
       analyser.fftSize = 2048;
       analyserRef.current = analyser;
@@ -69,8 +72,6 @@ export default function App() {
       e.preventDefault();
       handleZoom(e.deltaY < 0 ? 'in' : 'out');
     } else {
-      // Horizontal scroll with wheel
-      // e.deltaY is usually vertical scroll, mapping it to horizontal time scroll
       if (Math.abs(e.deltaY) > Math.abs(e.deltaX)) {
         setEditorState(prev => {
           const deltaSeconds = e.deltaY / prev.zoom;
@@ -81,7 +82,6 @@ export default function App() {
     }
   }, []);
 
-  // Attach wheel listener to tracks container
   useEffect(() => {
     const el = tracksContainerRef.current;
     if (el) {
@@ -92,58 +92,159 @@ export default function App() {
     };
   }, [handleWheel]);
 
+  // --- Track Processing Logic ---
+  const handleTrackProcess = async (id: string, type: 'silence' | 'denoise' | 'gate') => {
+    const trackIndex = tracks.findIndex(t => t.id === id);
+    if (trackIndex === -1) return;
+    const track = tracks[trackIndex];
+
+    if (track.isAnalysisOnly) {
+      setErrorMessage("Cannot process analysis-only tracks (File too large)");
+      return;
+    }
+
+    setIsProcessing(true);
+    // Stop playback if running
+    handleStop();
+
+    try {
+      let newBuffer: AudioBuffer;
+      
+      if (type === 'silence') {
+        setProcessingMessage(t.processingSilence);
+        newBuffer = await removeSilence(track.buffer);
+      } else if (type === 'denoise') {
+        setProcessingMessage(t.processingDenoise);
+        newBuffer = await applyDenoise(track.buffer);
+      } else {
+        setProcessingMessage(t.processingGate);
+        newBuffer = await applySmartGate(track.buffer);
+      }
+
+      setTracks(prev => {
+        const next = [...prev];
+        next[trackIndex] = { ...next[trackIndex], buffer: newBuffer };
+        updateDuration(next);
+        return next;
+      });
+
+    } catch (err) {
+      console.error(err);
+      setErrorMessage(t.processingFailed);
+    } finally {
+      setIsProcessing(false);
+      setProcessingMessage(null);
+    }
+  };
 
   // --- Import Logic ---
   const handleImport = async (e: React.ChangeEvent<HTMLInputElement>) => {
-    const file = e.target.files?.[0];
+    const input = e.target; // Capture input element ref immediately
+    const file = input.files?.[0];
+    
     if (!file) return;
 
-    setIsProcessing(true);
-    try {
-      initAudioContext();
-      if (!audioContextRef.current) throw new Error("AudioContext init failed");
+    if (file.size === 0) {
+       setErrorMessage(t.fileEmpty);
+       input.value = '';
+       return;
+    }
 
-      const arrayBuffer = await file.arrayBuffer();
+    setIsProcessing(true);
+    setProcessingMessage(t.readingFile);
+    setErrorMessage(null);
+
+    // Initialize Context
+    try {
+       initAudioContext();
+       if (!audioContextRef.current) throw new Error("AudioContext init failed");
+    } catch(e) {
+       setErrorMessage("Audio Engine Init Failed");
+       setIsProcessing(false);
+       return;
+    }
+
+    const ctx = audioContextRef.current;
+
+    try {
+      const lowerName = file.name.toLowerCase();
+      
+      // 1. Read Header Slice (First 512KB) for Analysis
+      // This is fast and low memory, works even for 2GB+ files
+      setProcessingMessage(t.analyzingHeaders);
+      const headerChunk = await readFileAsArrayBuffer(file.slice(0, 512 * 1024));
+      
       let detectedWavInfo: { bitDepth: number, sampleRate: number } | null = null;
       let detectedM4aInfo: { sampleRate: number, codec: string } | null = null;
       let m4aCodecInfo: { codec: string, isLossless: boolean } | null = null;
       
-      const lowerName = file.name.toLowerCase();
-      
       if (lowerName.endsWith('.wav')) {
-        detectedWavInfo = parseWavHeader(arrayBuffer);
+        detectedWavInfo = parseWavHeader(headerChunk);
       } else if (lowerName.match(/\.(m4a|mp4|aac)$/)) {
-        try { detectedM4aInfo = parseM4aHeader(arrayBuffer); } catch (e) { console.warn(e); }
-        m4aCodecInfo = detectM4aCodec(arrayBuffer);
+        try { 
+          detectedM4aInfo = parseM4aHeader(headerChunk); 
+          // If metadata wasn't found in first 512KB, it might be at the end of file (moov atom)
+          // Try reading tail if needed, but for now we proceed.
+        } catch (e) { console.warn(e); }
+        m4aCodecInfo = detectM4aCodec(headerChunk);
       }
 
-      const buffer = await audioContextRef.current.decodeAudioData(arrayBuffer.slice(0));
-      
+      // 2. Decide whether to load full file for playback
+      let buffer: AudioBuffer | null = null;
+      let isAnalysisOnly = false;
+      const isTooLarge = file.size > MAX_PLAYBACK_SIZE_BYTES;
+
+      if (!isTooLarge) {
+         setProcessingMessage(t.decoding);
+         try {
+           const fullBuffer = await readFileAsArrayBuffer(file);
+           buffer = await ctx.decodeAudioData(fullBuffer);
+         } catch (e) {
+           console.warn("Full decode failed, falling back to analysis mode", e);
+           isAnalysisOnly = true;
+         }
+      } else {
+         console.log("File too large (>1GB), skipping decode.");
+         isAnalysisOnly = true;
+      }
+
+      // 3. Fallback logic for Analysis Mode
+      if (isAnalysisOnly || !buffer) {
+        // Create dummy buffer (1s silence) just to satisfy types and show something
+        buffer = ctx.createBuffer(2, 48000, 48000);
+      }
+
+      // 4. Determine Metadata Display
       let bitDepthLabel = "Unknown";
       let bitrateLabel = "";
-      let displaySampleRate = buffer.sampleRate;
+      let displaySampleRate = buffer?.sampleRate || 0;
 
+      // Prefer header info over buffer info (buffer is resampled by Web Audio API usually)
       if (detectedWavInfo) {
-         const kbps = Math.round((detectedWavInfo.sampleRate * buffer.numberOfChannels * detectedWavInfo.bitDepth) / 1000);
-         bitrateLabel = `${kbps} kbps`;
+         const kbps = Math.round((detectedWavInfo.sampleRate * 2 * detectedWavInfo.bitDepth) / 1000); // approx stereo
+         bitrateLabel = `${kbps} kbps (WAV)`;
          displaySampleRate = detectedWavInfo.sampleRate;
+         bitDepthLabel = `${detectedWavInfo.bitDepth}-bit PCM`;
+      } else if (detectedM4aInfo) {
+         const kbps = estimateBitrate(file.size, 1); // Duration unknown without full parse?
+         bitrateLabel = `Container: ${detectedM4aInfo.codec}`;
+         displaySampleRate = detectedM4aInfo.sampleRate;
+         bitDepthLabel = m4aCodecInfo?.isLossless ? "ALAC (Lossless)" : "AAC (Lossy)";
       } else {
-         const kbps = estimateBitrate(file.size, buffer.duration);
-         bitrateLabel = `~${kbps} kbps`;
-         if (detectedM4aInfo) displaySampleRate = detectedM4aInfo.sampleRate;
-      }
-
-      if (detectedWavInfo) {
-        bitDepthLabel = `${detectedWavInfo.bitDepth}-bit PCM`;
-      } else {
-        const estimatedBits = detectBitDepthFromBuffer(buffer);
-        const estString = estimatedBits === 32 ? "32-bit Float" : `${estimatedBits}-bit`;
-        if (lowerName.endsWith('.flac')) bitDepthLabel = `FLAC (${estString})`;
-        else if (lowerName.match(/\.(m4a|mp4|aac)$/)) {
-           const codecName = m4aCodecInfo?.codec || detectedM4aInfo?.codec || "M4A";
-           bitDepthLabel = `${codecName} (${estString})`;
-        } else if (lowerName.endsWith('.mp3')) bitDepthLabel = `MP3 (${estString})`;
-        else bitDepthLabel = `${estString} (Est.)`;
+         // Fallback to estimation from size if we have duration (only if decoded)
+         if (!isAnalysisOnly && buffer) {
+            const kbps = estimateBitrate(file.size, buffer.duration);
+            bitrateLabel = `~${kbps} kbps`;
+            displaySampleRate = buffer.sampleRate;
+            
+            const estimatedBits = detectBitDepthFromBuffer(buffer);
+            const estString = estimatedBits === 32 ? "32-bit Float" : `${estimatedBits}-bit`;
+            bitDepthLabel = `${estString} (Est)`;
+         } else {
+            bitrateLabel = formatBytes(file.size);
+            bitDepthLabel = "Large File (Header N/A)";
+            displaySampleRate = 0;
+         }
       }
 
       const newTrack: Track = {
@@ -157,7 +258,8 @@ export default function App() {
         color: `hsl(${Math.random() * 360}, 70%, 60%)`,
         originalBitDepth: bitDepthLabel,
         originalSampleRate: displaySampleRate,
-        bitrate: bitrateLabel
+        bitrate: bitrateLabel,
+        isAnalysisOnly: isAnalysisOnly
       };
 
       setTracks(prev => {
@@ -166,12 +268,13 @@ export default function App() {
         return next;
       });
 
-    } catch (err) {
+    } catch (err: any) {
       console.error(err);
-      setErrorMessage(t.decodeError);
+      setErrorMessage(err.message || t.decodeError);
     } finally {
       setIsProcessing(false);
-      e.target.value = '';
+      setProcessingMessage(null);
+      input.value = ''; 
     }
   };
 
@@ -238,7 +341,7 @@ export default function App() {
   const handlePlay = (startTimeOverride?: number) => {
     if (!audioContextRef.current || tracks.length === 0) return;
     initAudioContext();
-    if (editorState.isPlaying) handleStop(); // Stop existing before starting new
+    if (editorState.isPlaying) handleStop();
 
     const ctx = audioContextRef.current;
     const startOffset = startTimeOverride !== undefined ? startTimeOverride : (editorState.currentTime >= editorState.duration ? 0 : editorState.currentTime);
@@ -247,14 +350,16 @@ export default function App() {
     const soloActive = tracks.some(t => t.isSolo);
     const activeTracks = tracks.filter(t => soloActive ? t.isSolo : !t.isMuted);
 
-    // Master Gain for visualizer connection
+    // Filter out analysis-only tracks from playback
+    const playableTracks = activeTracks.filter(t => !t.isAnalysisOnly);
+
     const masterGain = ctx.createGain();
     masterGain.connect(ctx.destination);
     if (analyserRef.current) {
       masterGain.connect(analyserRef.current);
     }
 
-    activeTracks.forEach(track => {
+    playableTracks.forEach(track => {
       const source = ctx.createBufferSource();
       source.buffer = track.buffer;
       const gainNode = ctx.createGain();
@@ -271,7 +376,7 @@ export default function App() {
     sourceNodesRef.current = sources;
     startTimeRef.current = ctx.currentTime - startOffset;
     
-    setEditorState(prev => ({ ...prev, isPlaying: true, currentTime: startOffset })); // Ensure state matches
+    setEditorState(prev => ({ ...prev, isPlaying: true, currentTime: startOffset }));
 
     const draw = () => {
       const now = ctx.currentTime;
@@ -284,9 +389,8 @@ export default function App() {
       }
       
       setEditorState(prev => {
-        // Auto-scroll logic: if playback head hits right edge
         const viewportWidth = tracksContainerRef.current?.clientWidth || 800;
-        const visibleDuration = (viewportWidth - 280) / prev.zoom; // 280 approx offset for sidebar
+        const visibleDuration = (viewportWidth - 280) / prev.zoom;
         const relativeTime = playbackTime - prev.scrollX;
         
         let newScroll = prev.scrollX;
@@ -324,7 +428,15 @@ export default function App() {
 
   const handleAiAction = async (task: 'transcribe' | 'summarize') => {
     if (!audioContextRef.current || tracks.length === 0) return;
+    
+    // Check if we have only analysis tracks
+    if (tracks.every(t => t.isAnalysisOnly)) {
+      setErrorMessage("Cannot process large files with Gemini (Size Limit).");
+      return;
+    }
+
     setIsProcessing(true);
+    setProcessingMessage(t.analyzing);
     setAiResult(null);
 
     try {
@@ -340,15 +452,14 @@ export default function App() {
       setErrorMessage("AI Analysis Failed. Check API Key or Audio length.");
     } finally {
       setIsProcessing(false);
+      setProcessingMessage(null);
     }
   };
 
   // Timeline Ruler Calculation
   const renderTimeRuler = () => {
     const ticks = [];
-    // Start from scrollX, go until scrollX + viewport
     const viewportWidth = tracksContainerRef.current?.clientWidth || 1000;
-    // Sidebar width is roughly 224px (w-56) + 40px ruler + padding. Let's assume safe width.
     const effectiveWidth = viewportWidth; 
     
     const startSec = Math.floor(editorState.scrollX);
@@ -441,7 +552,7 @@ export default function App() {
         {/* Toolbar & HUD */}
         <div className="flex items-center justify-between p-2 bg-gray-900 border-b border-gray-800">
            <div className="flex items-center gap-2">
-              <span className="text-[10px] font-bold text-gray-500 uppercase px-2 border-r border-gray-700">Display</span>
+              <span className="text-[10px] font-bold text-gray-500 uppercase px-2 border-r border-gray-700">{t.display}</span>
               
               <button 
                 onClick={() => setEditorState(s => ({ ...s, verticalScale: s.verticalScale === 'linear' ? 'db' : 'linear' }))}
@@ -456,16 +567,16 @@ export default function App() {
 
               <button onClick={() => handleZoom('out')} className="p-1 hover:bg-gray-700 rounded text-gray-400"><ZoomOut size={14} /></button>
               <div className="flex items-center gap-1 px-2 min-w-[60px] justify-center">
-                 <span className="text-[10px] text-gray-400">ZOOM</span>
+                 <span className="text-[10px] text-gray-400">{t.zoom}</span>
                  <span className="text-[10px] text-cyan-400 font-mono">{Math.round(editorState.zoom)}%</span>
               </div>
               <button onClick={() => handleZoom('in')} className="p-1 hover:bg-gray-700 rounded text-gray-400"><ZoomIn size={14} /></button>
            </div>
 
            <div className="flex items-center gap-2">
-              <span className="text-[10px] font-bold text-gray-500 uppercase px-2">Gemini AI Tools</span>
+              <span className="text-[10px] font-bold text-gray-500 uppercase px-2">{t.geminiAction}</span>
               <button onClick={() => handleAiAction('transcribe')} disabled={tracks.length === 0 || isProcessing} className="flex items-center gap-1.5 px-3 py-1 bg-indigo-900/50 hover:bg-indigo-900 border border-indigo-700/50 text-indigo-200 rounded text-xs disabled:opacity-50 transition-all">
-                {isProcessing ? <div className="w-3 h-3 border-2 border-white/30 border-t-white rounded-full animate-spin" /> : <Sparkles size={12} />}
+                {isProcessing && !processingMessage?.includes("Removing") ? <div className="w-3 h-3 border-2 border-white/30 border-t-white rounded-full animate-spin" /> : <Sparkles size={12} />}
                 <span>{t.transcribe}</span>
               </button>
               <button onClick={() => handleAiAction('summarize')} disabled={tracks.length === 0 || isProcessing} className="flex items-center gap-1.5 px-3 py-1 bg-gray-800 hover:bg-gray-700 border border-gray-600 text-gray-300 rounded text-xs disabled:opacity-50 transition-colors">
@@ -473,6 +584,19 @@ export default function App() {
               </button>
            </div>
         </div>
+
+        {/* Global Loading / Status Overlay */}
+        {isProcessing && (
+          <div className="absolute inset-0 z-50 bg-gray-950/80 backdrop-blur-sm flex flex-col items-center justify-center animate-in fade-in duration-200">
+             <div className="flex flex-col items-center gap-4 bg-gray-900 p-8 rounded-2xl border border-gray-700 shadow-2xl">
+               <div className="w-12 h-12 border-4 border-indigo-500/30 border-t-indigo-500 rounded-full animate-spin" />
+               <div className="text-center space-y-1">
+                 <div className="font-bold text-lg text-indigo-200">{processingMessage || t.analyzing}</div>
+                 <div className="text-xs text-gray-500">Please wait. Do not close this tab.</div>
+               </div>
+             </div>
+          </div>
+        )}
 
         {errorMessage && (
           <div className="absolute top-2 right-2 z-50 bg-red-950/90 border border-red-500/50 text-red-200 px-4 py-2 rounded shadow-xl flex items-center gap-2 backdrop-blur-sm animate-in fade-in slide-in-from-top-2">
@@ -488,7 +612,7 @@ export default function App() {
           {/* Time Ruler (Fixed to Background) */}
           <div className="sticky top-0 h-6 bg-gray-900 border-b border-gray-800 z-20 flex items-center shadow-sm">
              <div className="w-[282px] shrink-0 border-r border-gray-800 h-full flex items-center px-2 bg-gray-900 z-30">
-                <span className="text-[10px] text-gray-500 font-mono">TIMELINE</span>
+                <span className="text-[10px] text-gray-500 font-mono">{t.timeline}</span>
              </div>
              <div className="flex-1 relative h-full">
                 {renderTimeRuler()}
@@ -523,6 +647,15 @@ export default function App() {
                    })
                 }}
                 onSeek={handleSeek}
+                onProcess={handleTrackProcess}
+                labels={{
+                  menuTitle: t.processorMenu,
+                  removeSilence: t.removeSilence,
+                  denoise: t.denoise,
+                  removeFiller: t.removeFiller,
+                  mute: t.mute,
+                  solo: t.solo
+                }}
               />
             ))}
           </div>
@@ -548,7 +681,7 @@ export default function App() {
              <div className="flex items-center justify-between p-3 border-b border-gray-800 bg-indigo-950/20">
                <h3 className="text-sm font-bold text-indigo-300 flex items-center gap-2">
                  <Sparkles size={14} />
-                 GEMINI ANALYSIS
+                 {t.aiResult}
                </h3>
                <button onClick={() => setAiResult(null)} className="text-gray-400 hover:text-white">×</button>
              </div>
@@ -568,14 +701,14 @@ export default function App() {
         <div className="flex items-center gap-4">
            <div className="flex items-center gap-1">
              <Cpu size={10} />
-             <span>ENGINE: 32-BIT FLOAT</span>
+             <span>{t.engine}</span>
            </div>
            <div className="flex items-center gap-1">
              <MoveHorizontal size={10} />
-             <span>SCROLL: {editorState.scrollX.toFixed(2)}s</span>
+             <span>{t.scroll}: {editorState.scrollX.toFixed(2)}s</span>
            </div>
         </div>
-        <div>AUDIO SPEC PRO v2.0</div>
+        <div>AUDIO SPEC PRO v2.1</div>
       </footer>
     </div>
   );

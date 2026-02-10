@@ -22,6 +22,7 @@ export interface Track {
   originalBitDepth: string; // Display string for UI (e.g., "24-bit PCM")
   originalSampleRate: number; // The true sample rate of the file, not the context
   bitrate: string; // Display string for Bitrate (e.g. "320 kbps")
+  isAnalysisOnly?: boolean; // If true, file was too large to decode fully, only metadata is shown
 }
 
 export interface EditorState {
