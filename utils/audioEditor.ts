@@ -7,101 +7,100 @@ export const getAudioContext = (): AudioContext => {
   return ctx;
 };
 
-// Robust file reading helper with multiple strategies
-export const readFileAsArrayBuffer = async (blob: Blob): Promise<ArrayBuffer> => {
-  // Strategy 1: Response API (Most Robust for memory/permissions)
-  // This avoids reading the entire file into a FileReader string buffer first.
-  try {
-    return await new Response(blob).arrayBuffer();
-  } catch (e) {
-    console.warn("Response API strategy failed, falling back to FileReader", e);
-  }
-
-  // Strategy 2: FileReader (Fallback)
-  return new Promise((resolve, reject) => {
-    const reader = new FileReader();
-    
-    reader.onload = () => {
-      if (reader.result instanceof ArrayBuffer) {
-        resolve(reader.result);
-      } else {
-        reject(new Error("Result is not an ArrayBuffer"));
-      }
-    };
-    
-    reader.onerror = () => {
-      const msg = reader.error?.message || 'Unknown FileReader error';
-      reject(new Error(`File read failed: ${msg}`));
-    };
-    
-    try {
-        reader.readAsArrayBuffer(blob);
-    } catch (e: any) {
-        reject(new Error(`Failed to initiate file read: ${e.message}`));
-    }
-  });
-};
-
 export const decodeAudio = async (file: File, context: AudioContext): Promise<AudioBuffer> => {
-  const arrayBuffer = await readFileAsArrayBuffer(file);
-  // Decode a copy to prevent buffer detaching issues if the arrayBuffer is reused
-  return await context.decodeAudioData(arrayBuffer.slice(0));
+  const arrayBuffer = await file.arrayBuffer();
+  return await context.decodeAudioData(arrayBuffer);
 };
 
-export const bufferToWav = (buffer: AudioBuffer): Blob => {
+/**
+ * Exports AudioBuffer to WAV format with specified bit depth.
+ * @param buffer AudioBuffer to export
+ * @param bitDepth 16, 24, or 32 (Float)
+ */
+export const bufferToWav = (buffer: AudioBuffer, bitDepth: 16 | 24 | 32 = 16): Blob => {
   const numOfChan = buffer.numberOfChannels;
-  const length = buffer.length * numOfChan * 2 + 44;
-  const bufferArr = new ArrayBuffer(length);
+  const sampleRate = buffer.sampleRate;
+  const lengthSamples = buffer.length * numOfChan;
+  const bytesPerSample = bitDepth / 8;
+  const fileLength = 44 + lengthSamples * bytesPerSample;
+  
+  const bufferArr = new ArrayBuffer(fileLength);
   const view = new DataView(bufferArr);
   const channels = [];
-  let i;
-  let sample;
-  let offset = 0;
   let pos = 0;
 
-  // Write WAV Header
+  // --- WAV Header ---
+  const setUint16 = (data: number) => { view.setUint16(pos, data, true); pos += 2; };
+  const setUint32 = (data: number) => { view.setUint32(pos, data, true); pos += 4; };
+
   setUint32(0x46464952); // "RIFF"
-  setUint32(length - 8); // file length - 8
+  setUint32(fileLength - 8); // file length - 8
   setUint32(0x45564157); // "WAVE"
 
   setUint32(0x20746d66); // "fmt " chunk
   setUint32(16); // length = 16
-  setUint16(1); // PCM (uncompressed)
+  
+  // Format Code: 1 for PCM (Integer), 3 for IEEE Float
+  const formatCode = bitDepth === 32 ? 3 : 1; 
+  setUint16(formatCode);
+  
   setUint16(numOfChan);
-  setUint32(buffer.sampleRate);
-  setUint32(buffer.sampleRate * 2 * numOfChan); // avg. bytes/sec
-  setUint16(numOfChan * 2); // block-align
-  setUint16(16); // 16-bit (hardcoded in this encoder for compatibility)
+  setUint32(sampleRate);
+  setUint32(sampleRate * numOfChan * bytesPerSample); // byte rate
+  setUint16(numOfChan * bytesPerSample); // block-align
+  setUint16(bitDepth); // bits per sample
 
   setUint32(0x61746164); // "data" - chunk
-  setUint32(length - pos - 4); // chunk length
+  setUint32(lengthSamples * bytesPerSample); // chunk length
 
-  // Write interleaved data
-  for (i = 0; i < buffer.numberOfChannels; i++)
+  // --- Audio Data ---
+  
+  // Get all channel data
+  for (let i = 0; i < numOfChan; i++) {
     channels.push(buffer.getChannelData(i));
+  }
 
-  while (pos < buffer.length) {
-    for (i = 0; i < numOfChan; i++) {
-      // interleave channels
-      sample = Math.max(-1, Math.min(1, channels[i][pos])); // clamp
-      sample = (0.5 + sample < 0 ? sample * 32768 : sample * 32767) | 0; // scale to 16-bit signed int
-      view.setInt16(44 + offset, sample, true); // write 16-bit sample
-      offset += 2;
+  // Interleave and Write
+  let offset = 44; // Start of data
+  
+  if (bitDepth === 16) {
+    for (let i = 0; i < buffer.length; i++) {
+      for (let ch = 0; ch < numOfChan; ch++) {
+        let sample = channels[ch][i];
+        sample = Math.max(-1, Math.min(1, sample)); // clamp
+        // Scale to 16-bit signed: -32768 to 32767
+        sample = sample < 0 ? sample * 0x8000 : sample * 0x7FFF;
+        view.setInt16(offset, sample, true);
+        offset += 2;
+      }
     }
-    pos++;
+  } else if (bitDepth === 24) {
+    for (let i = 0; i < buffer.length; i++) {
+      for (let ch = 0; ch < numOfChan; ch++) {
+        let sample = channels[ch][i];
+        sample = Math.max(-1, Math.min(1, sample)); // clamp
+        // Scale to 24-bit signed: -8388608 to 8388607
+        sample = sample < 0 ? sample * 0x800000 : sample * 0x7FFFFF;
+        const intSample = Math.round(sample);
+        
+        // Write 3 bytes (little endian)
+        view.setUint8(offset, intSample & 0xFF);
+        view.setUint8(offset + 1, (intSample >> 8) & 0xFF);
+        view.setUint8(offset + 2, (intSample >> 16) & 0xFF);
+        offset += 3;
+      }
+    }
+  } else if (bitDepth === 32) {
+    for (let i = 0; i < buffer.length; i++) {
+      for (let ch = 0; ch < numOfChan; ch++) {
+        // IEEE 754 Float
+        view.setFloat32(offset, channels[ch][i], true);
+        offset += 4;
+      }
+    }
   }
 
   return new Blob([bufferArr], { type: "audio/wav" });
-
-  function setUint16(data: number) {
-    view.setUint16(pos, data, true);
-    pos += 2;
-  }
-
-  function setUint32(data: number) {
-    view.setUint32(pos, data, true);
-    pos += 4;
-  }
 };
 
 // Mix multiple tracks into a single AudioBuffer
@@ -119,8 +118,6 @@ export const mixTracks = (
   const activeTracks = soloTracks.length > 0 ? soloTracks : tracks.filter(t => !t.isMuted);
 
   for (const track of activeTracks) {
-    if (track.isAnalysisOnly) continue; // Skip large files that aren't loaded
-
     const trackBuffer = track.buffer;
     const trackLen = Math.min(length, trackBuffer.length);
     
@@ -140,7 +137,8 @@ export const mixTracks = (
 
 // Convert AudioBuffer to Base64 for Gemini
 export const audioBufferToBase64 = async (buffer: AudioBuffer): Promise<string> => {
-  const wavBlob = bufferToWav(buffer);
+  // Use 16-bit for Gemini Analysis to keep payload size reasonable
+  const wavBlob = bufferToWav(buffer, 16);
   return new Promise((resolve, reject) => {
     const reader = new FileReader();
     reader.onloadend = () => {

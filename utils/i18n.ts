@@ -28,24 +28,6 @@ export const translations = {
     scaleDb: "Scale: dBFS",
     dbTooltip: "0 dBFS = Max Level (Clipping Point)",
     bitDepth: "Bit Depth",
-    // New Translations
-    processorMenu: "Audio Processor",
-    removeSilence: "Remove Silence",
-    denoise: "Clean / Denoise",
-    removeFiller: "Remove Filler/Breath",
-    processingSilence: "Removing Silence...",
-    processingDenoise: "Applying Studio Clean (Denoise)...",
-    processingGate: "Removing Filter/Breath (Smart Gate)...",
-    readingFile: "Reading file (Unlimited Mode)...",
-    analyzingHeaders: "Analyzing headers...",
-    decoding: "Decoding Audio Data...",
-    fileEmpty: "File is empty.",
-    processingFailed: "Processing Failed.",
-    timeline: "TIMELINE",
-    display: "DISPLAY",
-    zoom: "ZOOM",
-    engine: "ENGINE: 32-BIT FLOAT",
-    scroll: "SCROLL"
   },
   ja: {
     appTitle: "AudioSpec Editor + Gemini",
@@ -74,23 +56,5 @@ export const translations = {
     scaleDb: "縦軸: dBFS",
     dbTooltip: "0 dBFS = 最大レベル（クリップ境界）",
     bitDepth: "ビット深度",
-    // New Translations
-    processorMenu: "音声処理ツール",
-    removeSilence: "無音カット (Silence Removal)",
-    denoise: "ノイズ・雑音除去 (Studio Clean)",
-    removeFiller: "フィラー・ブレス低減 (Smart Gate)",
-    processingSilence: "無音区間を削除中...",
-    processingDenoise: "ノイズ除去・クリーニング中...",
-    processingGate: "フィラー・ブレスを低減中...",
-    readingFile: "ファイルを読み込み中 (制限解除モード)...",
-    analyzingHeaders: "ヘッダー解析中...",
-    decoding: "音声デコード中...",
-    fileEmpty: "ファイルが空です。",
-    processingFailed: "処理に失敗しました。",
-    timeline: "タイムライン",
-    display: "表示設定",
-    zoom: "ズーム",
-    engine: "エンジン: 32-BIT FLOAT",
-    scroll: "スクロール"
   }
 };

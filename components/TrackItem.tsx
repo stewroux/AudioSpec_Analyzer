@@ -1,6 +1,6 @@
 import React, { useEffect, useRef, useState } from 'react';
 import { Track } from '../types';
-import { Volume2, Trash2, ArrowRight, Wand2, Scissors, Waves, MicOff, MoreVertical, HardDrive } from 'lucide-react';
+import { Volume2, Trash2, ArrowRight } from 'lucide-react';
 
 interface TrackItemProps {
   track: Track;
@@ -11,15 +11,6 @@ interface TrackItemProps {
   onUpdate: (id: string, updates: Partial<Track>) => void;
   onDelete: (id: string) => void;
   onSeek: (time: number) => void;
-  onProcess: (id: string, type: 'silence' | 'denoise' | 'gate') => void;
-  labels: {
-    menuTitle: string;
-    removeSilence: string;
-    denoise: string;
-    removeFiller: string;
-    mute: string;
-    solo: string;
-  };
 }
 
 export const TrackItem: React.FC<TrackItemProps> = ({ 
@@ -30,16 +21,12 @@ export const TrackItem: React.FC<TrackItemProps> = ({
   scrollX,
   onUpdate, 
   onDelete,
-  onSeek,
-  onProcess,
-  labels
+  onSeek
 }) => {
   const containerRef = useRef<HTMLDivElement>(null);
   const canvasRef = useRef<HTMLCanvasElement>(null);
   const rulerRef = useRef<HTMLCanvasElement>(null);
   const [canvasHeight, setCanvasHeight] = useState(128);
-  const [showMenu, setShowMenu] = useState(false);
-  const menuRef = useRef<HTMLDivElement>(null);
 
   // Resize Observer
   useEffect(() => {
@@ -47,30 +34,25 @@ export const TrackItem: React.FC<TrackItemProps> = ({
     const resizeObserver = new ResizeObserver((entries) => {
       for (const entry of entries) {
         const newHeight = Math.round(entry.contentRect.height);
-        if (newHeight !== canvasHeight) setCanvasHeight(newHeight);
+        // Use functional update to avoid dependency on canvasHeight
+        setCanvasHeight(prev => (prev !== newHeight ? newHeight : prev));
       }
     });
     resizeObserver.observe(containerRef.current);
     return () => resizeObserver.disconnect();
-  }, [canvasHeight]);
+  }, []); // Empty dependency array to prevent Observer recreation loop
 
-  // Handle Click Outside Menu
-  useEffect(() => {
-    const handleClickOutside = (event: MouseEvent) => {
-      if (menuRef.current && !menuRef.current.contains(event.target as Node)) {
-        setShowMenu(false);
-      }
-    };
-    document.addEventListener('mousedown', handleClickOutside);
-    return () => document.removeEventListener('mousedown', handleClickOutside);
-  }, []);
+  // Resize Observer handles canvas resolution (height attribute)
+  // CSS handles layout size (absolute positioning)
 
   // Handle Click to Seek
   const handleCanvasClick = (e: React.MouseEvent<HTMLCanvasElement>) => {
-    if (track.isAnalysisOnly) return;
     const rect = canvasRef.current?.getBoundingClientRect();
     if (!rect) return;
     const x = e.clientX - rect.left;
+    // Calculate time based on scroll and zoom
+    // x (pixels) / zoom (px/sec) = seconds from left edge
+    // + scrollX (seconds) = absolute time
     const time = (x / zoom) + scrollX;
     onSeek(Math.max(0, Math.min(time, duration)));
   };
@@ -111,7 +93,7 @@ export const TrackItem: React.FC<TrackItemProps> = ({
     }
   }, [verticalScale, canvasHeight]);
 
-  // Draw Waveform
+  // Draw Waveform (Optimized for Zoom/Scroll)
   useEffect(() => {
     const canvas = canvasRef.current;
     if (!canvas) return;
@@ -122,29 +104,14 @@ export const TrackItem: React.FC<TrackItemProps> = ({
     const height = canvas.height;
     ctx.clearRect(0, 0, width, height);
 
+    // Background
     ctx.fillStyle = '#0f172a';
     ctx.fillRect(0, 0, width, height);
 
-    if (track.isAnalysisOnly) {
-      // Draw Placeholder for Analysis Only
-      ctx.strokeStyle = '#334155';
-      ctx.setLineDash([5, 5]);
-      ctx.beginPath();
-      ctx.moveTo(0, height / 2);
-      ctx.lineTo(width, height / 2);
-      ctx.stroke();
-      ctx.setLineDash([]);
-      
-      ctx.fillStyle = '#475569';
-      ctx.font = '12px sans-serif';
-      ctx.textAlign = 'center';
-      ctx.fillText("Large File Mode - Waveform Unavailable", width / 2, height / 2 - 10);
-      ctx.fillText("(Metadata Analysis Only)", width / 2, height / 2 + 10);
-      return;
-    }
-
+    // Grid lines (Time) - Optional visual aid
     ctx.strokeStyle = '#1e293b';
     ctx.beginPath();
+    // Calculate start second based on scroll
     const startSec = Math.floor(scrollX);
     const endSec = Math.ceil(scrollX + (width / zoom));
     
@@ -155,6 +122,7 @@ export const TrackItem: React.FC<TrackItemProps> = ({
     }
     ctx.stroke();
 
+    // Center Line
     ctx.strokeStyle = '#334155';
     ctx.beginPath();
     ctx.moveTo(0, height / 2);
@@ -163,7 +131,12 @@ export const TrackItem: React.FC<TrackItemProps> = ({
 
     const data = track.buffer.getChannelData(0);
     const sampleRate = track.buffer.sampleRate;
+    
+    // Core Logic: Map pixels to audio buffer samples
+    // Start sample index based on scroll
     const startSampleIndex = Math.floor(scrollX * sampleRate);
+    // Samples per pixel depends on zoom
+    // 1 sec = zoom pixels -> 1 pixel = 1/zoom sec -> sampleRate/zoom samples
     const samplesPerPixel = sampleRate / zoom;
     
     ctx.beginPath();
@@ -171,16 +144,22 @@ export const TrackItem: React.FC<TrackItemProps> = ({
     ctx.lineWidth = 1;
 
     const mid = height / 2;
+    
+    // Performance optimization: Don't draw if out of bounds
     if (startSampleIndex >= data.length) return;
 
+    // Iterate over pixels on canvas
     for (let x = 0; x < width; x++) {
       const currentSampleStart = startSampleIndex + Math.floor(x * samplesPerPixel);
       const currentSampleEnd = startSampleIndex + Math.floor((x + 1) * samplesPerPixel);
       
       if (currentSampleStart >= data.length) break;
 
+      // Find min/max in this pixel's time slice (RMS-like visualization for zoomed out, simple for zoomed in)
       let min = 1.0;
       let max = -1.0;
+      
+      // Optimization: If zoomed out a lot, skip samples to keep performance
       const step = Math.max(1, Math.floor((currentSampleEnd - currentSampleStart) / 10)); 
 
       for (let i = currentSampleStart; i < currentSampleEnd; i += step) {
@@ -192,7 +171,9 @@ export const TrackItem: React.FC<TrackItemProps> = ({
       }
       
       if (min <= max) {
+         // Default is 0 width if silence, ensure line shows
          if (min === 1.0 && max === -1.0) { min = 0; max = 0; }
+         
          const yMin = mid + min * mid * 0.95; 
          const yMax = mid + max * mid * 0.95;
          ctx.moveTo(x, yMin);
@@ -200,137 +181,101 @@ export const TrackItem: React.FC<TrackItemProps> = ({
       }
     }
     ctx.stroke();
-  }, [track.buffer, track.color, zoom, scrollX, verticalScale, canvasHeight, track.isAnalysisOnly]);
+
+  }, [track.buffer, track.color, zoom, scrollX, verticalScale, canvasHeight]);
 
   return (
     <div ref={containerRef} className="flex bg-gray-900 border border-gray-700 rounded-lg overflow-hidden min-h-[8rem] shadow-lg transition-shadow hover:shadow-xl hover:border-gray-600 relative">
-      
-      {/* Track Controls */}
+      {/* Track Controls - Determines the height of the container */}
       <div className="w-56 bg-gray-800 p-3 flex flex-col justify-between border-r border-gray-700 shrink-0 gap-2 z-10 shadow-lg relative">
         <div>
           <div className="flex items-center justify-between mb-2">
-            <span className="text-sm font-bold text-gray-200 truncate w-24" title={track.name}>
+            <span className="text-sm font-bold text-gray-200 truncate w-32" title={track.name}>
               {track.name}
             </span>
-            <div className="flex items-center gap-1">
-              {!track.isAnalysisOnly && (
-                <div className="relative">
-                  <button 
-                    onClick={() => setShowMenu(!showMenu)}
-                    className={`p-1 rounded hover:bg-gray-700 transition-colors ${showMenu ? 'bg-gray-700 text-white' : 'text-gray-500'}`}
-                    title={labels.menuTitle}
-                  >
-                    <Wand2 size={14} />
-                  </button>
-                  
-                  {/* Process Menu */}
-                  {showMenu && (
-                    <div ref={menuRef} className="absolute left-0 top-full mt-1 w-56 bg-gray-800 border border-gray-600 rounded-lg shadow-2xl z-50 overflow-hidden animate-in fade-in zoom-in-95 duration-100">
-                      <div className="px-3 py-2 text-[10px] font-bold text-gray-500 uppercase tracking-wider bg-gray-900/50">{labels.menuTitle}</div>
-                      <button 
-                        onClick={() => { onProcess(track.id, 'silence'); setShowMenu(false); }}
-                        className="w-full text-left px-3 py-2 text-xs text-gray-200 hover:bg-indigo-600 hover:text-white flex items-center gap-2"
-                      >
-                        <Scissors size={12} /> {labels.removeSilence}
-                      </button>
-                      <button 
-                        onClick={() => { onProcess(track.id, 'denoise'); setShowMenu(false); }}
-                        className="w-full text-left px-3 py-2 text-xs text-gray-200 hover:bg-indigo-600 hover:text-white flex items-center gap-2"
-                      >
-                        <Waves size={12} /> {labels.denoise}
-                      </button>
-                      <button 
-                        onClick={() => { onProcess(track.id, 'gate'); setShowMenu(false); }}
-                        className="w-full text-left px-3 py-2 text-xs text-gray-200 hover:bg-indigo-600 hover:text-white flex items-center gap-2"
-                      >
-                        <MicOff size={12} /> {labels.removeFiller}
-                      </button>
-                    </div>
-                  )}
-                </div>
-              )}
-              <button onClick={() => onDelete(track.id)} className="text-gray-500 hover:text-red-400 p-1 hover:bg-gray-700 rounded">
-                <Trash2 size={14} />
-              </button>
-            </div>
+            <button onClick={() => onDelete(track.id)} className="text-gray-500 hover:text-red-400 p-1 hover:bg-gray-700 rounded">
+              <Trash2 size={14} />
+            </button>
           </div>
           
           <div className="flex flex-col gap-1.5 bg-gray-900/60 p-2.5 rounded border border-gray-700/50">
-             {/* Info block */}
-             <div className="flex items-center justify-between">
-              <span className="text-[9px] uppercase text-gray-400 font-bold tracking-widest">Rate</span>
-              <span className="text-[10px] font-mono text-cyan-300">{track.originalSampleRate} Hz</span>
+            <div className="flex items-center justify-between">
+              <span className="text-[9px] uppercase text-gray-400 font-bold tracking-widest">Format</span>
+              <span className="text-[10px] font-mono text-cyan-300 truncate max-w-[120px]" title={track.originalBitDepth}>
+                {track.originalBitDepth}
+              </span>
             </div>
+            
+            <div className="flex items-start justify-between">
+              <span className="text-[9px] uppercase text-gray-400 font-bold tracking-widest mt-0.5">Rate</span>
+              <div className="flex flex-col items-end">
+                <span className="text-[10px] font-mono text-cyan-300">
+                  {track.originalSampleRate} Hz
+                </span>
+                {track.originalSampleRate !== track.buffer.sampleRate && (
+                  <div className="flex items-center gap-1 text-[9px] text-yellow-500 font-medium mt-0.5" title={`Resampled to ${track.buffer.sampleRate} Hz`}>
+                    <ArrowRight size={8} />
+                    <span>{track.buffer.sampleRate} Hz</span>
+                  </div>
+                )}
+              </div>
+            </div>
+
             <div className="flex items-center justify-between">
               <span className="text-[9px] uppercase text-gray-400 font-bold tracking-widest">Bitrate</span>
               <span className="text-[10px] font-mono text-emerald-300">{track.bitrate}</span>
             </div>
-            <div className="flex items-center justify-between border-t border-gray-700/50 pt-1 mt-1">
-               <span className="text-[9px] uppercase text-gray-400 font-bold tracking-widest">Fmt</span>
-               <span className="text-[9px] font-mono text-indigo-300 truncate max-w-[80px]" title={track.originalBitDepth}>
-                  {track.originalBitDepth}
-               </span>
-            </div>
           </div>
         </div>
         
-        {track.isAnalysisOnly ? (
-          <div className="flex items-center justify-center gap-2 p-2 bg-yellow-900/20 border border-yellow-700/30 rounded text-yellow-500 text-xs">
-             <HardDrive size={14} />
-             <span className="font-bold">Metadata Only</span>
+        <div className="flex flex-col gap-3">
+          <div className="grid grid-cols-2 gap-2">
+            <button 
+              onClick={() => onUpdate(track.id, { isMuted: !track.isMuted })}
+              className={`text-[10px] font-bold py-1.5 rounded transition-colors ${track.isMuted ? 'bg-red-500/20 text-red-400 border border-red-500/50' : 'bg-gray-700 hover:bg-gray-600 text-gray-300 border border-transparent'}`}
+            >
+              MUTE
+            </button>
+            <button 
+              onClick={() => onUpdate(track.id, { isSolo: !track.isSolo })}
+              className={`text-[10px] font-bold py-1.5 rounded transition-colors ${track.isSolo ? 'bg-yellow-500/20 text-yellow-400 border border-yellow-500/50' : 'bg-gray-700 hover:bg-gray-600 text-gray-300 border border-transparent'}`}
+            >
+              SOLO
+            </button>
           </div>
-        ) : (
-          <div className="flex flex-col gap-3">
-            <div className="grid grid-cols-2 gap-2">
-              <button 
-                onClick={() => onUpdate(track.id, { isMuted: !track.isMuted })}
-                className={`text-[10px] font-bold py-1.5 rounded transition-colors ${track.isMuted ? 'bg-red-500/20 text-red-400 border border-red-500/50' : 'bg-gray-700 hover:bg-gray-600 text-gray-300 border border-transparent'}`}
-              >
-                {labels.mute}
-              </button>
-              <button 
-                onClick={() => onUpdate(track.id, { isSolo: !track.isSolo })}
-                className={`text-[10px] font-bold py-1.5 rounded transition-colors ${track.isSolo ? 'bg-yellow-500/20 text-yellow-400 border border-yellow-500/50' : 'bg-gray-700 hover:bg-gray-600 text-gray-300 border border-transparent'}`}
-              >
-                {labels.solo}
-              </button>
-            </div>
 
-            <div className="flex items-center gap-2">
-              <Volume2 size={14} className="text-gray-400" />
-              <div className="relative w-full h-4 flex items-center">
-                <input 
-                  type="range" 
-                  min="0" 
-                  max="1.2" 
-                  step="0.05" 
-                  value={track.volume}
-                  onChange={(e) => onUpdate(track.id, { volume: parseFloat(e.target.value) })}
-                  className="w-full h-1 bg-gray-600 rounded-lg appearance-none cursor-pointer [&::-webkit-slider-thumb]:appearance-none [&::-webkit-slider-thumb]:w-3 [&::-webkit-slider-thumb]:h-3 [&::-webkit-slider-thumb]:bg-indigo-400 [&::-webkit-slider-thumb]:rounded-full [&::-webkit-slider-thumb]:hover:scale-125 transition-all"
-                />
-              </div>
+          <div className="flex items-center gap-2">
+            <Volume2 size={14} className="text-gray-400" />
+            <div className="relative w-full h-4 flex items-center">
+              <input 
+                type="range" 
+                min="0" 
+                max="1.2" 
+                step="0.05" 
+                value={track.volume}
+                onChange={(e) => onUpdate(track.id, { volume: parseFloat(e.target.value) })}
+                className="w-full h-1 bg-gray-600 rounded-lg appearance-none cursor-pointer [&::-webkit-slider-thumb]:appearance-none [&::-webkit-slider-thumb]:w-3 [&::-webkit-slider-thumb]:h-3 [&::-webkit-slider-thumb]:bg-indigo-400 [&::-webkit-slider-thumb]:rounded-full [&::-webkit-slider-thumb]:hover:scale-125 transition-all"
+              />
             </div>
           </div>
-        )}
+        </div>
       </div>
 
-      {/* Vertical Ruler */}
+      {/* Vertical Ruler - Absolute positioning to fill height determined by siblings */}
       <div className="w-10 bg-gray-850 border-r border-gray-700 shrink-0 relative">
-        <canvas ref={rulerRef} width={40} height={canvasHeight} className="w-full h-full" />
+        <canvas ref={rulerRef} width={40} height={canvasHeight} className="absolute inset-0 w-full h-full" />
       </div>
 
-      {/* Waveform Area */}
-      <div className={`flex-1 bg-gray-950 relative ${!track.isAnalysisOnly ? 'cursor-crosshair group' : ''}`}>
+      {/* Waveform Area - Absolute positioning to fill height determined by siblings */}
+      <div className="flex-1 bg-gray-950 relative cursor-crosshair group">
         <canvas 
           ref={canvasRef} 
           width={1000} 
           height={canvasHeight} 
-          className="w-full h-full block"
+          className="absolute inset-0 w-full h-full block"
           onClick={handleCanvasClick}
         />
-        {!track.isAnalysisOnly && (
-          <div className="absolute inset-0 pointer-events-none opacity-0 group-hover:opacity-100 transition-opacity bg-white/5" />
-        )}
+        <div className="absolute inset-0 pointer-events-none opacity-0 group-hover:opacity-100 transition-opacity bg-white/5" />
       </div>
     </div>
   );

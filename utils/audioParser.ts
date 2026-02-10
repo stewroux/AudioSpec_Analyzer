@@ -5,9 +5,9 @@
 export const parseWavHeader = (buffer: ArrayBuffer): { bitDepth: number, sampleRate: number } | null => {
   const dataView = new DataView(buffer);
   
+  // Check for RIFF header
   if (dataView.byteLength < 12) return null;
 
-  // Check for RIFF header
   const riff = String.fromCharCode(
     dataView.getUint8(0),
     dataView.getUint8(1),
@@ -27,9 +27,12 @@ export const parseWavHeader = (buffer: ArrayBuffer): { bitDepth: number, sampleR
 
   if (wave !== 'WAVE') return null;
 
-  // Search for "fmt " chunk
+  // Search for chunks
   let offset = 12;
-  while (offset + 8 <= dataView.byteLength) {
+  while (offset < dataView.byteLength) {
+    // Ensure we have enough bytes to read chunk header (8 bytes)
+    if (offset + 8 > dataView.byteLength) break;
+
     const chunkId = String.fromCharCode(
       dataView.getUint8(offset),
       dataView.getUint8(offset + 1),
@@ -40,19 +43,26 @@ export const parseWavHeader = (buffer: ArrayBuffer): { bitDepth: number, sampleR
     // Chunk size is 32-bit little endian
     const chunkSize = dataView.getUint32(offset + 4, true);
 
-    if (chunkId === 'fmt ' && chunkSize >= 16) {
-      if (offset + 24 > dataView.byteLength) break; // Check bounds for format struct
+    if (chunkId === 'fmt ') {
+      // AudioFormat (2 bytes) - offset + 8
+      // NumChannels (2 bytes) - offset + 10
+      // SampleRate (4 bytes) - offset + 12
+      // ByteRate (4 bytes) - offset + 16
+      // BlockAlign (2 bytes) - offset + 20
+      // BitsPerSample (2 bytes) - offset + 22 (chunk data start is offset+8, so +14 relative to data)
       
-      const sampleRate = dataView.getUint32(offset + 12, true);
-      const bitsPerSample = dataView.getUint16(offset + 22, true);
-      
-      return { bitDepth: bitsPerSample, sampleRate: sampleRate };
+      // Ensure fmt chunk is large enough
+      if (chunkSize >= 16) {
+        const sampleRate = dataView.getUint32(offset + 12, true);
+        const bitsPerSample = dataView.getUint16(offset + 22, true);
+        return { bitDepth: bitsPerSample, sampleRate: sampleRate };
+      }
     }
 
     // Move to next chunk
-    const nextOffset = offset + 8 + chunkSize;
-    if (nextOffset <= offset) break; // Overflow protection
-    offset = nextOffset;
+    // RIFF chunks are word-aligned (2 bytes). If chunkSize is odd, there is a padding byte.
+    const padding = chunkSize % 2;
+    offset += 8 + chunkSize + padding;
   }
 
   return null;
@@ -60,12 +70,12 @@ export const parseWavHeader = (buffer: ArrayBuffer): { bitDepth: number, sampleR
 
 /**
  * Parses MP4/M4A container to find the original sample rate defined in the 'stsd' atom.
- * This is necessary because Web Audio API resamples everything to the context rate.
+ * Uses a recursive approach to find atoms within their parent containers.
  */
 export const parseM4aHeader = (buffer: ArrayBuffer): { sampleRate: number, codec: string } | null => {
   const dataView = new DataView(buffer);
   
-  const findAtom = (start: number, end: number, targetType: string): { start: number, size: number } | null => {
+  const findAtom = (start: number, end: number, targetType: string): { start: number, size: number, contentStart: number } | null => {
     let offset = start;
     while (offset + 8 <= end) {
       const size = dataView.getUint32(offset);
@@ -77,60 +87,72 @@ export const parseM4aHeader = (buffer: ArrayBuffer): { sampleRate: number, codec
       );
 
       if (type === targetType) {
-        return { start: offset, size: size };
+        return { start: offset, size: size, contentStart: offset + 8 };
       }
 
-      if (size < 8) break; 
+      // Valid atom check
+      if (size < 8) {
+        // Size 1 means extended size (64-bit), Size 0 means to end of file.
+        // For this simple parser, we skip complex cases or 0-size atoms unless it's the target.
+        if (size === 1) {
+           // Skip 64-bit size atoms for now to avoid complexity, or implement reading extra 8 bytes
+           const extSize = Number(dataView.getBigUint64(offset + 8));
+           offset += extSize;
+           continue;
+        }
+        break; 
+      }
       
       offset += size;
-      if (offset > end) break;
     }
     return null;
   };
 
-  const getAtomContent = (start: number, size: number) => {
-    return { start: start + 8, end: start + size };
-  };
-
-  // 1. Find 'moov' (Movie Atom)
+  // Traversal Path: moov -> trak -> mdia -> minf -> stbl -> stsd
   const moov = findAtom(0, buffer.byteLength, 'moov');
   if (!moov) return null;
 
-  // 2. Find 'trak' (Track Atom) - Use the first track
-  const moovContent = getAtomContent(moov.start, moov.size);
-  const trak = findAtom(moovContent.start, moovContent.end, 'trak');
+  // Find the first 'trak' inside 'moov'
+  const trak = findAtom(moov.contentStart, moov.start + moov.size, 'trak');
   if (!trak) return null;
 
-  // 3. Find 'mdia' (Media Atom)
-  const trakContent = getAtomContent(trak.start, trak.size);
-  const mdia = findAtom(trakContent.start, trakContent.end, 'mdia');
+  const mdia = findAtom(trak.contentStart, trak.start + trak.size, 'mdia');
   if (!mdia) return null;
 
-  // 4. Find 'minf' (Media Information Atom)
-  const mdiaContent = getAtomContent(mdia.start, mdia.size);
-  const minf = findAtom(mdiaContent.start, mdiaContent.end, 'minf');
+  const minf = findAtom(mdia.contentStart, mdia.start + mdia.size, 'minf');
   if (!minf) return null;
 
-  // 5. Find 'stbl' (Sample Table Atom)
-  const minfContent = getAtomContent(minf.start, minf.size);
-  const stbl = findAtom(minfContent.start, minfContent.end, 'stbl');
+  const stbl = findAtom(minf.contentStart, minf.start + minf.size, 'stbl');
   if (!stbl) return null;
 
-  // 6. Find 'stsd' (Sample Description Atom)
-  const stblContent = getAtomContent(stbl.start, stbl.size);
-  const stsd = findAtom(stblContent.start, stblContent.end, 'stsd');
+  const stsd = findAtom(stbl.contentStart, stbl.start + stbl.size, 'stsd');
   if (!stsd) return null;
 
   // Parse 'stsd'
-  const stsdBodyStart = stsd.start + 16; 
-  if (stsdBodyStart + 36 > buffer.byteLength) return null;
-
+  // Header: 4 bytes size, 4 bytes type, 1 byte version, 3 bytes flags, 4 bytes entry_count
+  const stsdBodyStart = stsd.contentStart + 8; // +8 for version/flags/entry_count
+  
+  // We assume the first entry is the audio description
+  // Entry header is standard atom header (4 size, 4 type)
+  const entrySize = dataView.getUint32(stsdBodyStart);
   const entryType = String.fromCharCode(
     dataView.getUint8(stsdBodyStart + 4),
     dataView.getUint8(stsdBodyStart + 5),
     dataView.getUint8(stsdBodyStart + 6),
     dataView.getUint8(stsdBodyStart + 7)
   );
+
+  // AudioSampleEntry (mp4a, alac, etc)
+  // Structure relative to Entry Start (stsdBodyStart):
+  // 0-7: Atom Header
+  // 8-13: Reserved (6 bytes)
+  // 14-15: DataReferenceIndex (2 bytes)
+  // 16-23: Reserved / Version (8 bytes)
+  // 24-25: ChannelCount (2 bytes)
+  // 26-27: SampleSize (2 bytes)
+  // 28-29: PreDefined (2 bytes)
+  // 30-31: Reserved (2 bytes)
+  // 32-35: SampleRate (16.16 Fixed Point)
 
   const sampleRateFixed = dataView.getUint32(stsdBodyStart + 32);
   const sampleRate = sampleRateFixed >>> 16; 
@@ -199,8 +221,13 @@ export const estimateBitrate = (size: number, duration: number): number => {
   return Math.round((size * 8) / duration / 1000);
 };
 
+/**
+ * Analyzes decoded audio buffer to estimate the original bit depth.
+ * Returns 16, 24, or 32 (Float).
+ */
 export const detectBitDepthFromBuffer = (buffer: AudioBuffer): number => {
   const channelData = buffer.getChannelData(0);
+  
   let is16Bit = true;
   let is24Bit = true;
   let checks = 0;
@@ -209,6 +236,7 @@ export const detectBitDepthFromBuffer = (buffer: AudioBuffer): number => {
 
   for (let i = 0; i < channelData.length; i += stride) {
     const sample = channelData[i];
+    
     if (Math.abs(sample) < 1e-9) continue;
 
     if (is16Bit) {
