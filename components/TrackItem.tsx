@@ -144,7 +144,7 @@ export const TrackItem: React.FC<TrackItemProps> = ({
       {/* Track Controls */}
       <div className="w-56 bg-gray-800 p-3 flex flex-col justify-between border-r border-gray-700 shrink-0">
         <div>
-          <div className="flex items-center justify-between mb-1">
+          <div className="flex items-center justify-between mb-2">
             <span className="text-sm font-bold text-gray-200 truncate w-32" title={track.name}>
               {track.name}
             </span>
@@ -152,8 +152,16 @@ export const TrackItem: React.FC<TrackItemProps> = ({
               <Trash2 size={14} />
             </button>
           </div>
-          <div className="text-xs font-mono text-cyan-400 mb-2">
-            {track.originalBitDepth} / {track.buffer.sampleRate}Hz
+          
+          <div className="flex flex-col gap-0.5 mb-2 bg-gray-900/50 p-2 rounded">
+            <div className="flex items-center justify-between">
+              <span className="text-[10px] uppercase text-gray-500 font-bold tracking-wider">Fmt</span>
+              <span className="text-xs font-mono text-cyan-400 truncate max-w-[140px]" title={track.originalBitDepth}>{track.originalBitDepth}</span>
+            </div>
+            <div className="flex items-center justify-between">
+              <span className="text-[10px] uppercase text-gray-500 font-bold tracking-wider">Rate</span>
+              <span className="text-xs font-mono text-cyan-400">{track.buffer.sampleRate} Hz</span>
+            </div>
           </div>
         </div>
         

@@ -59,15 +59,27 @@ export default function App() {
       // 1. Detect Bit Depth from original file before decoding
       const arrayBuffer = await file.arrayBuffer();
       let bitDepthLabel = "Unknown";
+      const lowerName = file.name.toLowerCase();
       
-      if (file.name.endsWith('.wav')) {
+      if (lowerName.endsWith('.wav')) {
         const bits = parseWavHeader(arrayBuffer);
-        bitDepthLabel = bits ? `${bits}-bit PCM` : "32-bit Float";
-      } else if (file.name.endsWith('.flac')) {
-        bitDepthLabel = "Variable (Lossless)";
-      } else if (file.name.match(/\.(m4a|mp4|aac)$/)) {
+        bitDepthLabel = bits ? `${bits}-bit PCM` : "WAV (Float/Unknown)";
+      } else if (lowerName.endsWith('.flac')) {
+        bitDepthLabel = "FLAC (Lossless)";
+      } else if (lowerName.match(/\.(m4a|mp4|aac)$/)) {
         const info = detectM4aCodec(arrayBuffer);
-        bitDepthLabel = info ? info.codec : "AAC/M4A";
+        // Distinguish between AAC (Lossy) and ALAC (Lossless)
+        if (info) {
+           bitDepthLabel = info.isLossless ? "ALAC (Lossless)" : "AAC (Lossy)";
+        } else {
+           bitDepthLabel = "AAC/M4A";
+        }
+      } else if (lowerName.endsWith('.mp3')) {
+        bitDepthLabel = "MP3 (Lossy)";
+      } else if (lowerName.endsWith('.ogg')) {
+        bitDepthLabel = "OGG (Lossy)";
+      } else if (lowerName.endsWith('.aiff') || lowerName.endsWith('.aif')) {
+        bitDepthLabel = "AIFF (PCM)";
       } else {
         bitDepthLabel = "Compressed";
       }
