@@ -20,6 +20,7 @@ export interface Track {
   isSolo: boolean;
   color: string;
   originalBitDepth: string; // Display string for UI (e.g., "24-bit PCM")
+  originalSampleRate: number; // The true sample rate of the file, not the context
   bitrate: string; // Display string for Bitrate (e.g. "320 kbps")
 }
 

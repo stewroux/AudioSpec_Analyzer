@@ -1,8 +1,8 @@
 /**
  * Parses the ArrayBuffer of an audio file to find specific headers.
- * Currently optimized for WAV/RIFF to find the true Bit Depth.
+ * Currently optimized for WAV/RIFF to find the true Bit Depth and Sample Rate.
  */
-export const parseWavHeader = (buffer: ArrayBuffer): number | null => {
+export const parseWavHeader = (buffer: ArrayBuffer): { bitDepth: number, sampleRate: number } | null => {
   const dataView = new DataView(buffer);
   
   // Check for RIFF header
@@ -39,15 +39,17 @@ export const parseWavHeader = (buffer: ArrayBuffer): number | null => {
     const chunkSize = dataView.getUint32(offset + 4, true);
 
     if (chunkId === 'fmt ') {
-      // AudioFormat (2 bytes)
-      // NumChannels (2 bytes)
-      // SampleRate (4 bytes)
-      // ByteRate (4 bytes)
-      // BlockAlign (2 bytes)
-      // BitsPerSample (2 bytes) -> This is what we want! (Offset 14 bytes from chunk data start)
+      // AudioFormat (2 bytes) - offset + 8
+      // NumChannels (2 bytes) - offset + 10
+      // SampleRate (4 bytes) - offset + 12
+      // ByteRate (4 bytes) - offset + 16
+      // BlockAlign (2 bytes) - offset + 20
+      // BitsPerSample (2 bytes) - offset + 22 (chunk data start is offset+8, so +14 relative to data)
       
-      const bitsPerSample = dataView.getUint16(offset + 8 + 14, true);
-      return bitsPerSample;
+      const sampleRate = dataView.getUint32(offset + 12, true);
+      const bitsPerSample = dataView.getUint16(offset + 22, true);
+      
+      return { bitDepth: bitsPerSample, sampleRate: sampleRate };
     }
 
     // Move to next chunk

@@ -56,43 +56,47 @@ export default function App() {
       initAudioContext();
       if (!audioContextRef.current) throw new Error("AudioContext init failed");
 
-      // 1. Detect Bit Depth from original file before decoding
+      // 1. Detect Bit Depth & Sample Rate from original file before decoding
       const arrayBuffer = await file.arrayBuffer();
-      let detectedWavBits: number | null = null;
+      let detectedWavInfo: { bitDepth: number, sampleRate: number } | null = null;
       let m4aInfo: { codec: string, isLossless: boolean } | null = null;
       const lowerName = file.name.toLowerCase();
       
       if (lowerName.endsWith('.wav')) {
-        detectedWavBits = parseWavHeader(arrayBuffer);
+        detectedWavInfo = parseWavHeader(arrayBuffer);
       } else if (lowerName.match(/\.(m4a|mp4|aac)$/)) {
         m4aInfo = detectM4aCodec(arrayBuffer);
       }
 
-      // 2. Decode for Web Audio (converts to 32-bit float internal)
+      // 2. Decode for Web Audio (converts to 32-bit float internal, and resamples to context rate)
       const buffer = await audioContextRef.current.decodeAudioData(arrayBuffer.slice(0));
       
       // 3. Determine Display Labels
       let bitDepthLabel = "Unknown";
       let bitrateLabel = "";
+      let displaySampleRate = buffer.sampleRate; // Default to context rate
 
       // Bitrate Calculation
-      if (detectedWavBits) {
+      if (detectedWavInfo) {
          // Exact for Linear PCM: SampleRate * Channels * Bits
-         const kbps = Math.round((buffer.sampleRate * buffer.numberOfChannels * detectedWavBits) / 1000);
+         const kbps = Math.round((detectedWavInfo.sampleRate * buffer.numberOfChannels * detectedWavInfo.bitDepth) / 1000);
          bitrateLabel = `${kbps} kbps`;
+         displaySampleRate = detectedWavInfo.sampleRate; // Use original rate from header
       } else {
          // Approx for others: (Size * 8) / Duration
          const kbps = estimateBitrate(file.size, buffer.duration);
          bitrateLabel = `~${kbps} kbps`;
+         // For non-WAV, we unfortunately often rely on the decoded buffer rate 
+         // unless we parse MP3/AAC frames which is complex without libraries.
       }
 
       // Bit Depth / Format Label Generation
-      if (detectedWavBits) {
-        bitDepthLabel = `${detectedWavBits}-bit PCM`;
+      if (detectedWavInfo) {
+        bitDepthLabel = `${detectedWavInfo.bitDepth}-bit PCM`;
       } else {
         // Fallback: Analyze decoded buffer to estimate bit depth
         const estimatedBits = detectBitDepthFromBuffer(buffer);
-        const estString = estimatedBits === 32 ? "Float" : `${estimatedBits}-bit`;
+        const estString = estimatedBits === 32 ? "32-bit Float" : `${estimatedBits}-bit`;
 
         if (lowerName.endsWith('.flac')) {
           bitDepthLabel = `FLAC (${estString})`;
@@ -121,6 +125,7 @@ export default function App() {
         isSolo: false,
         color: `hsl(${Math.random() * 360}, 70%, 60%)`,
         originalBitDepth: bitDepthLabel,
+        originalSampleRate: displaySampleRate,
         bitrate: bitrateLabel
       };
 
@@ -165,7 +170,8 @@ export default function App() {
           isMuted: false,
           isSolo: false,
           color: '#ef4444',
-          originalBitDepth: "WebM / Float",
+          originalBitDepth: "WebM / 32-bit Float",
+          originalSampleRate: audioBuffer.sampleRate, // Recording matches context
           bitrate: `~${kbps} kbps`
         };
 
@@ -201,7 +207,7 @@ export default function App() {
     if (editorState.isPlaying) handleStop();
 
     const ctx = audioContextRef.current;
-    const startOffset = editorState.currentTime;
+    const startOffset = editorState.currentTime >= editorState.duration ? 0 : editorState.currentTime;
     const sources: AudioBufferSourceNode[] = [];
 
     const soloActive = tracks.some(t => t.isSolo);
@@ -229,10 +235,19 @@ export default function App() {
     const draw = () => {
       const now = ctx.currentTime;
       const playbackTime = now - startTimeRef.current;
+      
       if (playbackTime >= editorState.duration) {
-        handleStop();
+        // Auto-stop and reset to start
+        sourceNodesRef.current.forEach(node => {
+          try { node.stop(); } catch(e) {}
+        });
+        sourceNodesRef.current = [];
+        if (animationFrameRef.current) cancelAnimationFrame(animationFrameRef.current);
+        
+        setEditorState(prev => ({ ...prev, isPlaying: false, currentTime: 0 }));
         return;
       }
+      
       setEditorState(prev => ({ ...prev, currentTime: playbackTime }));
       animationFrameRef.current = requestAnimationFrame(draw);
     };

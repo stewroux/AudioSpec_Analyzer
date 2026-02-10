@@ -73,7 +73,7 @@ export const TrackItem: React.FC<TrackItemProps> = ({
     } else {
       // dBFS: 0, -6, -12, -24, -inf
       // Simple mapping: 20 * log10(amp). 
-      // y = height/2 - (amp * height/2). 
+      // y = height/2 - (amp * height / 2). 
       const dBTicks = [0, -6, -12, -24];
       dBTicks.forEach(db => {
         const amp = Math.pow(10, db / 20);
@@ -176,7 +176,7 @@ export const TrackItem: React.FC<TrackItemProps> = ({
             </div>
             <div className="flex items-center justify-between">
               <span className="text-[10px] uppercase text-gray-500 font-bold tracking-wider">Rate</span>
-              <span className="text-xs font-mono text-cyan-400">{track.buffer.sampleRate} Hz</span>
+              <span className="text-xs font-mono text-cyan-400">{track.originalSampleRate} Hz</span>
             </div>
             <div className="flex items-center justify-between">
               <span className="text-[10px] uppercase text-gray-500 font-bold tracking-wider">Bitrate</span>
