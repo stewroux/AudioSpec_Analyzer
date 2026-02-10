@@ -70,94 +70,117 @@ export const parseWavHeader = (buffer: ArrayBuffer): { bitDepth: number, sampleR
 
 /**
  * Parses MP4/M4A container to find the original sample rate defined in the 'stsd' atom.
- * Uses a recursive approach to find atoms within their parent containers.
+ * Scans all tracks to find an audio track.
  */
 export const parseM4aHeader = (buffer: ArrayBuffer): { sampleRate: number, codec: string } | null => {
   const dataView = new DataView(buffer);
   
-  const findAtom = (start: number, end: number, targetType: string): { start: number, size: number, contentStart: number } | null => {
+  // Helper to read 4-char code
+  const getFourCC = (offset: number) => {
+    return String.fromCharCode(
+      dataView.getUint8(offset),
+      dataView.getUint8(offset + 1),
+      dataView.getUint8(offset + 2),
+      dataView.getUint8(offset + 3)
+    );
+  };
+
+  // Iterates over child atoms of a container
+  const iterateAtoms = (start: number, end: number, callback: (type: string, start: number, size: number, contentStart: number) => void) => {
     let offset = start;
     while (offset + 8 <= end) {
       const size = dataView.getUint32(offset);
-      const type = String.fromCharCode(
-        dataView.getUint8(offset + 4),
-        dataView.getUint8(offset + 5),
-        dataView.getUint8(offset + 6),
-        dataView.getUint8(offset + 7)
-      );
-
-      if (type === targetType) {
-        return { start: offset, size: size, contentStart: offset + 8 };
-      }
-
-      // Valid atom check
+      const type = getFourCC(offset + 4);
+      
       if (size < 8) {
-        // Size 1 means extended size (64-bit), Size 0 means to end of file.
-        // For this simple parser, we skip complex cases or 0-size atoms unless it's the target.
-        if (size === 1) {
-           // Skip 64-bit size atoms for now to avoid complexity, or implement reading extra 8 bytes
+         if (size === 1) {
            const extSize = Number(dataView.getBigUint64(offset + 8));
+           callback(type, offset, extSize, offset + 16);
            offset += extSize;
            continue;
-        }
-        break; 
+         }
+         break; // Invalid or 0 (to EOF)
       }
-      
+
+      callback(type, offset, size, offset + 8);
       offset += size;
     }
-    return null;
   };
 
-  // Traversal Path: moov -> trak -> mdia -> minf -> stbl -> stsd
-  const moov = findAtom(0, buffer.byteLength, 'moov');
+  let result: { sampleRate: number, codec: string } | null = null;
+
+  const moov = (() => {
+    let found = null;
+    iterateAtoms(0, buffer.byteLength, (type, start, size, contentStart) => {
+      if (type === 'moov') found = { start, size, contentStart };
+    });
+    return found;
+  })();
+  
   if (!moov) return null;
 
-  // Find the first 'trak' inside 'moov'
-  const trak = findAtom(moov.contentStart, moov.start + moov.size, 'trak');
-  if (!trak) return null;
+  // Search inside moov for tracks
+  const searchTrack = (trakStart: number, trakSize: number, trakContentStart: number) => {
+    let mdia: any = null;
+    iterateAtoms(trakContentStart, trakStart + trakSize, (type, s, z, c) => {
+       if (type === 'mdia') mdia = { s, z, c };
+    });
+    if (!mdia) return;
 
-  const mdia = findAtom(trak.contentStart, trak.start + trak.size, 'mdia');
-  if (!mdia) return null;
+    let minf: any = null;
+    iterateAtoms(mdia.c, mdia.s + mdia.z, (type, s, z, c) => {
+       if (type === 'minf') minf = { s, z, c };
+    });
+    if (!minf) return;
 
-  const minf = findAtom(mdia.contentStart, mdia.start + mdia.size, 'minf');
-  if (!minf) return null;
+    let stbl: any = null;
+    iterateAtoms(minf.c, minf.s + minf.z, (type, s, z, c) => {
+       if (type === 'stbl') stbl = { s, z, c };
+    });
+    if (!stbl) return;
 
-  const stbl = findAtom(minf.contentStart, minf.start + minf.size, 'stbl');
-  if (!stbl) return null;
+    let stsd: any = null;
+    iterateAtoms(stbl.c, stbl.s + stbl.z, (type, s, z, c) => {
+       if (type === 'stsd') stsd = { s, z, c };
+    });
+    if (!stsd) return;
 
-  const stsd = findAtom(stbl.contentStart, stbl.start + stbl.size, 'stsd');
-  if (!stsd) return null;
+    // Parse stsd
+    // Header: 4 bytes size, 4 bytes type, 1 byte version, 3 bytes flags, 4 bytes entry_count
+    const stsdBodyStart = stsd.c + 8;
+    const entryCount = dataView.getUint32(stsd.c + 4); // technically at offset+4 inside content is version/flags, count is at +8 relative to atom start? No.
+    // stsd version (1) + flags (3) + count (4) = 8 bytes.
+    
+    // We only check the first entry for simplicity, or iterate if needed
+    if (stsdBodyStart + 8 > stbl.s + stbl.z) return;
 
-  // Parse 'stsd'
-  // Header: 4 bytes size, 4 bytes type, 1 byte version, 3 bytes flags, 4 bytes entry_count
-  const stsdBodyStart = stsd.contentStart + 8; // +8 for version/flags/entry_count
-  
-  // We assume the first entry is the audio description
-  // Entry header is standard atom header (4 size, 4 type)
-  const entrySize = dataView.getUint32(stsdBodyStart);
-  const entryType = String.fromCharCode(
-    dataView.getUint8(stsdBodyStart + 4),
-    dataView.getUint8(stsdBodyStart + 5),
-    dataView.getUint8(stsdBodyStart + 6),
-    dataView.getUint8(stsdBodyStart + 7)
-  );
+    const entrySize = dataView.getUint32(stsdBodyStart);
+    const entryType = getFourCC(stsdBodyStart + 4);
 
-  // AudioSampleEntry (mp4a, alac, etc)
-  // Structure relative to Entry Start (stsdBodyStart):
-  // 0-7: Atom Header
-  // 8-13: Reserved (6 bytes)
-  // 14-15: DataReferenceIndex (2 bytes)
-  // 16-23: Reserved / Version (8 bytes)
-  // 24-25: ChannelCount (2 bytes)
-  // 26-27: SampleSize (2 bytes)
-  // 28-29: PreDefined (2 bytes)
-  // 30-31: Reserved (2 bytes)
-  // 32-35: SampleRate (16.16 Fixed Point)
+    // Check for known audio formats
+    if (['mp4a', 'alac', 'samr', 'ulaw', 'alaw', 'lpcm'].includes(entryType)) {
+      // AudioSampleEntry
+      // Sample Rate is at offset 32 relative to entry start (16.16 fixed point)
+      // entry start = stsdBodyStart
+      const sampleRateFixed = dataView.getUint32(stsdBodyStart + 32);
+      const sampleRate = sampleRateFixed >>> 16;
+      
+      // If we found a valid audio track, set result and stop
+      if (sampleRate > 0) {
+        result = { sampleRate, codec: entryType };
+      }
+    }
+  };
 
-  const sampleRateFixed = dataView.getUint32(stsdBodyStart + 32);
-  const sampleRate = sampleRateFixed >>> 16; 
+  // Iterate all tracks in moov
+  iterateAtoms(moov.contentStart, moov.start + moov.size, (type, start, size, contentStart) => {
+    if (result) return; // Found one already
+    if (type === 'trak') {
+      searchTrack(start, size, contentStart);
+    }
+  });
 
-  return { sampleRate, codec: entryType };
+  return result;
 };
 
 /**

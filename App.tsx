@@ -358,7 +358,8 @@ export default function App() {
     // Start from scrollX, go until scrollX + viewport
     const viewportWidth = tracksContainerRef.current?.clientWidth || 1000;
     // Sidebar width is roughly 224px (w-56) + 40px ruler + padding. Let's assume safe width.
-    const effectiveWidth = viewportWidth; 
+    // 16px (padding) + 1px (border) + 224px (sidebar) + 40px (ruler) = 281px
+    const effectiveWidth = viewportWidth - 281; 
     
     const startSec = Math.floor(editorState.scrollX);
     const endSec = startSec + (effectiveWidth / editorState.zoom) + 1;
@@ -368,7 +369,7 @@ export default function App() {
       if (left < 0) continue;
       
       ticks.push(
-        <div key={s} className="absolute top-0 bottom-0 border-l border-gray-700 select-none pointer-events-none" style={{ left: `${282 + left}px` }}>
+        <div key={s} className="absolute top-0 bottom-0 border-l border-gray-700 select-none pointer-events-none" style={{ left: `${left}px` }}>
            <span className="absolute top-1 left-1 text-[10px] text-gray-500 font-mono">{new Date(s * 1000).toISOString().substr(14, 5)}</span>
         </div>
       );
@@ -511,7 +512,7 @@ export default function App() {
           
           {/* Time Ruler (Fixed to Background) */}
           <div className="sticky top-0 h-6 bg-gray-900 border-b border-gray-800 z-20 flex items-center shadow-sm">
-             <div className="w-[282px] shrink-0 border-r border-gray-800 h-full flex items-center px-2 bg-gray-900 z-30">
+             <div className="w-[281px] shrink-0 border-r border-gray-800 h-full flex items-center px-2 bg-gray-900 z-30">
                 <span className="text-[10px] text-gray-500 font-mono">TIMELINE</span>
              </div>
              <div className="flex-1 relative h-full">
@@ -556,7 +557,8 @@ export default function App() {
              <div 
                className="absolute top-6 bottom-0 w-px bg-red-500 z-10 pointer-events-none mix-blend-screen"
                style={{ 
-                 left: `${282 + (editorState.currentTime - editorState.scrollX) * editorState.zoom}px`,
+                 // 16px (padding) + 1px (border) + 224px (sidebar) + 40px (ruler) = 281px
+                 left: `${281 + (editorState.currentTime - editorState.scrollX) * editorState.zoom}px`,
                  display: (editorState.currentTime < editorState.scrollX) ? 'none' : 'block'
                }} 
              >

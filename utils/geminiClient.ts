@@ -16,6 +16,8 @@ export const analyzeAudioWithGemini = async (
     ? (lang === 'ja' ? "この音声を高精度に文字起こししてください。" : "Transcribe this audio accurately.")
     : (lang === 'ja' ? "この音声の内容を要約し、重要なポイントを箇条書きでリストアップしてください。" : "Summarize this audio and list key points.");
 
+  // Use standard Gemini 2.5 Flash for multimodal generation
+  // The 'native-audio' models are often restricted to Live API (WebSockets)
   const modelName = 'gemini-2.5-flash';
 
   try {
