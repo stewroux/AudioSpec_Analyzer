@@ -117,3 +117,16 @@ export const formatDuration = (seconds: number) => {
   const milliseconds = Math.floor((seconds % 1) * 100);
   return `${minutes}:${remainingSeconds.toString().padStart(2, '0')}.${milliseconds.toString().padStart(2, '0')}`;
 };
+
+/**
+ * Estimates bitrate in kbps based on file size and duration.
+ * @param size File size in bytes
+ * @param duration Duration in seconds
+ */
+export const estimateBitrate = (size: number, duration: number): number => {
+  if (duration <= 0) return 0;
+  // bytes * 8 = bits
+  // bits / duration = bps
+  // bps / 1000 = kbps
+  return Math.round((size * 8) / duration / 1000);
+};

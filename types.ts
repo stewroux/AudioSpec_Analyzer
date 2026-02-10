@@ -20,6 +20,7 @@ export interface Track {
   isSolo: boolean;
   color: string;
   originalBitDepth: string; // Display string for UI (e.g., "24-bit PCM")
+  bitrate: string; // Display string for Bitrate (e.g. "320 kbps")
 }
 
 export interface EditorState {

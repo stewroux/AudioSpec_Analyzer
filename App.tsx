@@ -3,7 +3,7 @@ import { translations, Language } from './utils/i18n';
 import { Track, EditorState, AiAnalysisResult } from './types';
 import { getAudioContext, decodeAudio, mixTracks, bufferToWav } from './utils/audioEditor';
 import { analyzeAudioWithGemini } from './utils/geminiClient';
-import { parseWavHeader, detectM4aCodec } from './utils/audioParser';
+import { parseWavHeader, detectM4aCodec, estimateBitrate } from './utils/audioParser';
 import { TrackItem } from './components/TrackItem';
 import { Play, Pause, Square, Mic, Upload, Download, Sparkles, AlertCircle, Globe, Plus, Cpu, Ruler } from 'lucide-react';
 
@@ -46,7 +46,7 @@ export default function App() {
     setEditorState(prev => ({ ...prev, duration: Math.max(10, maxDur) }));
   }, []);
 
-  // --- Import Logic with Bit Depth Detection ---
+  // --- Import Logic with Bit Depth & Bitrate Detection ---
   const handleImport = async (e: React.ChangeEvent<HTMLInputElement>) => {
     const file = e.target.files?.[0];
     if (!file) return;
@@ -59,11 +59,12 @@ export default function App() {
       // 1. Detect Bit Depth from original file before decoding
       const arrayBuffer = await file.arrayBuffer();
       let bitDepthLabel = "Unknown";
+      let detectedWavBits: number | null = null;
       const lowerName = file.name.toLowerCase();
       
       if (lowerName.endsWith('.wav')) {
-        const bits = parseWavHeader(arrayBuffer);
-        bitDepthLabel = bits ? `${bits}-bit PCM` : "WAV (Float/Unknown)";
+        detectedWavBits = parseWavHeader(arrayBuffer);
+        bitDepthLabel = detectedWavBits ? `${detectedWavBits}-bit PCM` : "WAV (Float/Unknown)";
       } else if (lowerName.endsWith('.flac')) {
         bitDepthLabel = "FLAC (Lossless)";
       } else if (lowerName.match(/\.(m4a|mp4|aac)$/)) {
@@ -87,6 +88,18 @@ export default function App() {
       // 2. Decode for Web Audio (converts to 32-bit float internal)
       const buffer = await audioContextRef.current.decodeAudioData(arrayBuffer.slice(0));
       
+      // 3. Calculate Bitrate
+      let bitrateLabel = "";
+      if (detectedWavBits) {
+         // Exact for Linear PCM: SampleRate * Channels * Bits
+         const kbps = Math.round((buffer.sampleRate * buffer.numberOfChannels * detectedWavBits) / 1000);
+         bitrateLabel = `${kbps} kbps`;
+      } else {
+         // Approx for others: (Size * 8) / Duration
+         const kbps = estimateBitrate(file.size, buffer.duration);
+         bitrateLabel = `~${kbps} kbps`;
+      }
+
       const newTrack: Track = {
         id: crypto.randomUUID(),
         name: file.name,
@@ -96,7 +109,8 @@ export default function App() {
         isMuted: false,
         isSolo: false,
         color: `hsl(${Math.random() * 360}, 70%, 60%)`,
-        originalBitDepth: bitDepthLabel
+        originalBitDepth: bitDepthLabel,
+        bitrate: bitrateLabel
       };
 
       setTracks(prev => {
@@ -129,6 +143,9 @@ export default function App() {
         const arrayBuffer = await blob.arrayBuffer();
         const audioBuffer = await audioContextRef.current.decodeAudioData(arrayBuffer);
 
+        // Calculate approx bitrate for recording
+        const kbps = estimateBitrate(blob.size, audioBuffer.duration);
+
         const newTrack: Track = {
           id: crypto.randomUUID(),
           name: "Mic Recording",
@@ -137,7 +154,8 @@ export default function App() {
           isMuted: false,
           isSolo: false,
           color: '#ef4444',
-          originalBitDepth: "16-bit (Mic)"
+          originalBitDepth: "16-bit (Mic)",
+          bitrate: `~${kbps} kbps`
         };
 
         setTracks(prev => {
