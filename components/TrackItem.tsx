@@ -1,6 +1,6 @@
 import React, { useEffect, useRef, useState } from 'react';
 import { Track } from '../types';
-import { Volume2, Trash2 } from 'lucide-react';
+import { Volume2, Trash2, ArrowRight } from 'lucide-react';
 
 interface TrackItemProps {
   track: Track;
@@ -171,13 +171,27 @@ export const TrackItem: React.FC<TrackItemProps> = ({
           
           <div className="flex flex-col gap-1 bg-gray-900/50 p-2 rounded">
             <div className="flex items-center justify-between">
-              <span className="text-[10px] uppercase text-gray-500 font-bold tracking-wider">Fmt</span>
-              <span className="text-xs font-mono text-cyan-400 truncate max-w-[140px]" title={track.originalBitDepth}>{track.originalBitDepth}</span>
+              <span className="text-[10px] uppercase text-gray-500 font-bold tracking-wider" title="Source Format">Src</span>
+              <span className="text-xs font-mono text-cyan-400 truncate max-w-[140px]" title={`Source: ${track.originalBitDepth}`}>
+                {track.originalBitDepth}
+              </span>
             </div>
-            <div className="flex items-center justify-between">
-              <span className="text-[10px] uppercase text-gray-500 font-bold tracking-wider">Rate</span>
-              <span className="text-xs font-mono text-cyan-400">{track.originalSampleRate} Hz</span>
+            
+            <div className="flex items-start justify-between">
+              <span className="text-[10px] uppercase text-gray-500 font-bold tracking-wider mt-0.5">Rate</span>
+              <div className="flex flex-col items-end">
+                <span className="text-xs font-mono text-cyan-400">
+                  {track.originalSampleRate} Hz
+                </span>
+                {track.originalSampleRate !== track.buffer.sampleRate && (
+                  <div className="flex items-center gap-1 text-[10px] text-yellow-500 font-medium" title={`Playback: ${track.buffer.sampleRate} Hz`}>
+                    <ArrowRight size={10} />
+                    <span>{track.buffer.sampleRate} Hz</span>
+                  </div>
+                )}
+              </div>
             </div>
+
             <div className="flex items-center justify-between">
               <span className="text-[10px] uppercase text-gray-500 font-bold tracking-wider">Bitrate</span>
               <span className="text-xs font-mono text-cyan-400">{track.bitrate}</span>
