@@ -130,3 +130,54 @@ export const estimateBitrate = (size: number, duration: number): number => {
   // bps / 1000 = kbps
   return Math.round((size * 8) / duration / 1000);
 };
+
+/**
+ * Analyzes decoded audio buffer to estimate the original bit depth.
+ * Useful for lossless formats (ALAC, FLAC) or checking if a float buffer comes from 16/24-bit source.
+ * Returns 16, 24, or 32 (Float).
+ */
+export const detectBitDepthFromBuffer = (buffer: AudioBuffer): number => {
+  const channelData = buffer.getChannelData(0);
+  
+  // Check first few thousand non-silent samples
+  let is16Bit = true;
+  let is24Bit = true;
+  let checks = 0;
+  const maxChecks = 4000;
+  const stride = 10;
+
+  for (let i = 0; i < channelData.length; i += stride) {
+    const sample = channelData[i];
+    
+    // Skip absolute silence as it fits all bit depths
+    if (Math.abs(sample) < 1e-9) continue;
+
+    // Check 16-bit: sample * 32768 should be an integer (within small tolerance)
+    if (is16Bit) {
+      const scaled = sample * 32768;
+      if (Math.abs(scaled - Math.round(scaled)) > 1e-5) {
+        is16Bit = false;
+      }
+    }
+
+    // Check 24-bit: sample * 8388608 should be an integer
+    if (is24Bit) {
+      const scaled = sample * 8388608;
+      if (Math.abs(scaled - Math.round(scaled)) > 1e-5) {
+        is24Bit = false;
+      }
+    }
+
+    if (!is16Bit && !is24Bit) break;
+    
+    checks++;
+    if (checks > maxChecks) break;
+  }
+
+  // If we checked enough samples and it fits 16-bit, it's likely 16-bit.
+  // 16-bit fits inside 24-bit logic, so check 16-bit first.
+  if (is16Bit && checks > 0) return 16;
+  if (is24Bit && checks > 0) return 24;
+  
+  return 32; // Default to 32-bit Float
+};

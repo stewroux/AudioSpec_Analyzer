@@ -3,7 +3,7 @@ import { translations, Language } from './utils/i18n';
 import { Track, EditorState, AiAnalysisResult } from './types';
 import { getAudioContext, decodeAudio, mixTracks, bufferToWav } from './utils/audioEditor';
 import { analyzeAudioWithGemini } from './utils/geminiClient';
-import { parseWavHeader, detectM4aCodec, estimateBitrate } from './utils/audioParser';
+import { parseWavHeader, detectM4aCodec, estimateBitrate, detectBitDepthFromBuffer } from './utils/audioParser';
 import { TrackItem } from './components/TrackItem';
 import { Play, Pause, Square, Mic, Upload, Download, Sparkles, AlertCircle, Globe, Plus, Cpu, Ruler } from 'lucide-react';
 
@@ -58,38 +58,24 @@ export default function App() {
 
       // 1. Detect Bit Depth from original file before decoding
       const arrayBuffer = await file.arrayBuffer();
-      let bitDepthLabel = "Unknown";
       let detectedWavBits: number | null = null;
+      let m4aInfo: { codec: string, isLossless: boolean } | null = null;
       const lowerName = file.name.toLowerCase();
       
       if (lowerName.endsWith('.wav')) {
         detectedWavBits = parseWavHeader(arrayBuffer);
-        bitDepthLabel = detectedWavBits ? `${detectedWavBits}-bit PCM` : "WAV (Float/Unknown)";
-      } else if (lowerName.endsWith('.flac')) {
-        bitDepthLabel = "FLAC (Lossless)";
       } else if (lowerName.match(/\.(m4a|mp4|aac)$/)) {
-        const info = detectM4aCodec(arrayBuffer);
-        // Distinguish between AAC (Lossy) and ALAC (Lossless)
-        if (info) {
-           bitDepthLabel = info.isLossless ? "ALAC (Lossless)" : "AAC (Lossy)";
-        } else {
-           bitDepthLabel = "AAC/M4A";
-        }
-      } else if (lowerName.endsWith('.mp3')) {
-        bitDepthLabel = "MP3 (Lossy)";
-      } else if (lowerName.endsWith('.ogg')) {
-        bitDepthLabel = "OGG (Lossy)";
-      } else if (lowerName.endsWith('.aiff') || lowerName.endsWith('.aif')) {
-        bitDepthLabel = "AIFF (PCM)";
-      } else {
-        bitDepthLabel = "Compressed";
+        m4aInfo = detectM4aCodec(arrayBuffer);
       }
 
       // 2. Decode for Web Audio (converts to 32-bit float internal)
       const buffer = await audioContextRef.current.decodeAudioData(arrayBuffer.slice(0));
       
-      // 3. Calculate Bitrate
+      // 3. Determine Display Labels
+      let bitDepthLabel = "Unknown";
       let bitrateLabel = "";
+
+      // Bitrate Calculation
       if (detectedWavBits) {
          // Exact for Linear PCM: SampleRate * Channels * Bits
          const kbps = Math.round((buffer.sampleRate * buffer.numberOfChannels * detectedWavBits) / 1000);
@@ -98,6 +84,31 @@ export default function App() {
          // Approx for others: (Size * 8) / Duration
          const kbps = estimateBitrate(file.size, buffer.duration);
          bitrateLabel = `~${kbps} kbps`;
+      }
+
+      // Bit Depth / Format Label Generation
+      if (detectedWavBits) {
+        bitDepthLabel = `${detectedWavBits}-bit PCM`;
+      } else {
+        // Fallback: Analyze decoded buffer to estimate bit depth
+        const estimatedBits = detectBitDepthFromBuffer(buffer);
+        const estString = estimatedBits === 32 ? "Float" : `${estimatedBits}-bit`;
+
+        if (lowerName.endsWith('.flac')) {
+          bitDepthLabel = `FLAC (${estString})`;
+        } else if (m4aInfo) {
+           // M4A (AAC or ALAC)
+           bitDepthLabel = `${m4aInfo.codec} (${estString})`;
+        } else if (lowerName.endsWith('.mp3')) {
+          bitDepthLabel = `MP3 (${estString})`;
+        } else if (lowerName.endsWith('.ogg')) {
+          bitDepthLabel = `OGG (${estString})`;
+        } else if (lowerName.endsWith('.aiff') || lowerName.endsWith('.aif')) {
+          bitDepthLabel = `AIFF (${estString})`;
+        } else {
+          // Generic fallback
+          bitDepthLabel = `${estString} (Est.)`;
+        }
       }
 
       const newTrack: Track = {
@@ -154,7 +165,7 @@ export default function App() {
           isMuted: false,
           isSolo: false,
           color: '#ef4444',
-          originalBitDepth: "16-bit (Mic)",
+          originalBitDepth: "WebM / Float",
           bitrate: `~${kbps} kbps`
         };
 

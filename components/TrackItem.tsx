@@ -1,4 +1,4 @@
-import React, { useEffect, useRef } from 'react';
+import React, { useEffect, useRef, useState } from 'react';
 import { Track } from '../types';
 import { Volume2, Trash2 } from 'lucide-react';
 
@@ -17,8 +17,28 @@ export const TrackItem: React.FC<TrackItemProps> = ({
   onUpdate, 
   onDelete 
 }) => {
+  const containerRef = useRef<HTMLDivElement>(null);
   const canvasRef = useRef<HTMLCanvasElement>(null);
   const rulerRef = useRef<HTMLCanvasElement>(null);
+  const [canvasHeight, setCanvasHeight] = useState(128);
+
+  // Resize Observer to adjust canvas height based on container height (which is driven by content)
+  useEffect(() => {
+    if (!containerRef.current) return;
+    
+    const resizeObserver = new ResizeObserver((entries) => {
+      for (const entry of entries) {
+        // Update canvas height to match container, ensuring 1:1 pixel mapping for sharpness
+        const newHeight = Math.round(entry.contentRect.height);
+        if (newHeight !== canvasHeight) {
+          setCanvasHeight(newHeight);
+        }
+      }
+    });
+
+    resizeObserver.observe(containerRef.current);
+    return () => resizeObserver.disconnect();
+  }, [canvasHeight]);
 
   // Draw Vertical Ruler (Scale)
   useEffect(() => {
@@ -53,7 +73,7 @@ export const TrackItem: React.FC<TrackItemProps> = ({
     } else {
       // dBFS: 0, -6, -12, -24, -inf
       // Simple mapping: 20 * log10(amp). 
-      // y = height/2 - (amp * height / 2). 
+      // y = height/2 - (amp * height/2). 
       const dBTicks = [0, -6, -12, -24];
       dBTicks.forEach(db => {
         const amp = Math.pow(10, db / 20);
@@ -73,7 +93,7 @@ export const TrackItem: React.FC<TrackItemProps> = ({
       });
     }
 
-  }, [verticalScale]);
+  }, [verticalScale, canvasHeight]);
 
   // Draw Waveform
   useEffect(() => {
@@ -125,10 +145,6 @@ export const TrackItem: React.FC<TrackItemProps> = ({
       
       if (min <= max) {
          // Transform based on Vertical Scale?
-         // For simple visualization, we usually stick to Linear mapping even if ruler is dB,
-         // because drawing logarithmic waveforms is computationally heavier and looks "thinner".
-         // However, visual consistency is good. Let's stick to Linear drawing for performance,
-         // but the ruler shows dB equivalents.
          const yMin = mid + min * mid * 0.95; // 0.95 to avoid edge clipping
          const yMax = mid + max * mid * 0.95;
          ctx.moveTo(x, yMin);
@@ -137,12 +153,12 @@ export const TrackItem: React.FC<TrackItemProps> = ({
     }
     ctx.stroke();
 
-  }, [track.buffer, track.color, duration, verticalScale]);
+  }, [track.buffer, track.color, duration, verticalScale, canvasHeight]);
 
   return (
-    <div className="flex bg-gray-900 border border-gray-700 rounded-lg overflow-hidden h-32">
+    <div ref={containerRef} className="flex bg-gray-900 border border-gray-700 rounded-lg overflow-hidden min-h-[8rem]">
       {/* Track Controls */}
-      <div className="w-56 bg-gray-800 p-3 flex flex-col justify-between border-r border-gray-700 shrink-0">
+      <div className="w-56 bg-gray-800 p-3 flex flex-col justify-between border-r border-gray-700 shrink-0 gap-2">
         <div>
           <div className="flex items-center justify-between mb-2">
             <span className="text-sm font-bold text-gray-200 truncate w-32" title={track.name}>
@@ -153,7 +169,7 @@ export const TrackItem: React.FC<TrackItemProps> = ({
             </button>
           </div>
           
-          <div className="flex flex-col gap-0.5 mb-2 bg-gray-900/50 p-2 rounded">
+          <div className="flex flex-col gap-1 bg-gray-900/50 p-2 rounded">
             <div className="flex items-center justify-between">
               <span className="text-[10px] uppercase text-gray-500 font-bold tracking-wider">Fmt</span>
               <span className="text-xs font-mono text-cyan-400 truncate max-w-[140px]" title={track.originalBitDepth}>{track.originalBitDepth}</span>
@@ -169,38 +185,40 @@ export const TrackItem: React.FC<TrackItemProps> = ({
           </div>
         </div>
         
-        <div className="flex gap-2 mb-2">
-          <button 
-            onClick={() => onUpdate(track.id, { isMuted: !track.isMuted })}
-            className={`flex-1 text-xs py-1 rounded border ${track.isMuted ? 'bg-red-900/50 text-red-300 border-red-700' : 'bg-gray-700 text-gray-300 border-gray-600'}`}
-          >
-            Mute
-          </button>
-          <button 
-            onClick={() => onUpdate(track.id, { isSolo: !track.isSolo })}
-            className={`flex-1 text-xs py-1 rounded border ${track.isSolo ? 'bg-yellow-900/50 text-yellow-300 border-yellow-700' : 'bg-gray-700 text-gray-300 border-gray-600'}`}
-          >
-            Solo
-          </button>
-        </div>
+        <div className="flex flex-col gap-2">
+          <div className="flex gap-2">
+            <button 
+              onClick={() => onUpdate(track.id, { isMuted: !track.isMuted })}
+              className={`flex-1 text-xs py-1 rounded border ${track.isMuted ? 'bg-red-900/50 text-red-300 border-red-700' : 'bg-gray-700 text-gray-300 border-gray-600'}`}
+            >
+              Mute
+            </button>
+            <button 
+              onClick={() => onUpdate(track.id, { isSolo: !track.isSolo })}
+              className={`flex-1 text-xs py-1 rounded border ${track.isSolo ? 'bg-yellow-900/50 text-yellow-300 border-yellow-700' : 'bg-gray-700 text-gray-300 border-gray-600'}`}
+            >
+              Solo
+            </button>
+          </div>
 
-        <div className="flex items-center gap-2">
-          <Volume2 size={14} className="text-gray-400" />
-          <input 
-            type="range" 
-            min="0" 
-            max="1.2" 
-            step="0.05" 
-            value={track.volume}
-            onChange={(e) => onUpdate(track.id, { volume: parseFloat(e.target.value) })}
-            className="w-full h-1 bg-gray-600 rounded-lg appearance-none cursor-pointer [&::-webkit-slider-thumb]:appearance-none [&::-webkit-slider-thumb]:w-3 [&::-webkit-slider-thumb]:h-3 [&::-webkit-slider-thumb]:bg-indigo-500 [&::-webkit-slider-thumb]:rounded-full"
-          />
+          <div className="flex items-center gap-2">
+            <Volume2 size={14} className="text-gray-400" />
+            <input 
+              type="range" 
+              min="0" 
+              max="1.2" 
+              step="0.05" 
+              value={track.volume}
+              onChange={(e) => onUpdate(track.id, { volume: parseFloat(e.target.value) })}
+              className="w-full h-1 bg-gray-600 rounded-lg appearance-none cursor-pointer [&::-webkit-slider-thumb]:appearance-none [&::-webkit-slider-thumb]:w-3 [&::-webkit-slider-thumb]:h-3 [&::-webkit-slider-thumb]:bg-indigo-500 [&::-webkit-slider-thumb]:rounded-full"
+            />
+          </div>
         </div>
       </div>
 
       {/* Vertical Ruler */}
       <div className="w-10 bg-gray-850 border-r border-gray-700 shrink-0 relative">
-        <canvas ref={rulerRef} width={40} height={128} className="w-full h-full" />
+        <canvas ref={rulerRef} width={40} height={canvasHeight} className="w-full h-full" />
       </div>
 
       {/* Waveform Area */}
@@ -208,7 +226,7 @@ export const TrackItem: React.FC<TrackItemProps> = ({
         <canvas 
           ref={canvasRef} 
           width={1000} 
-          height={128} 
+          height={canvasHeight} 
           className="w-full h-full block"
         />
         {/* Clips/Regions would be overlaid here in a full DAW */}
