@@ -3,7 +3,7 @@ import { translations, Language } from './utils/i18n';
 import { Track, EditorState, AiAnalysisResult } from './types';
 import { getAudioContext, decodeAudio, mixTracks, bufferToWav } from './utils/audioEditor';
 import { analyzeAudioWithGemini } from './utils/geminiClient';
-import { parseWavHeader, detectM4aCodec, estimateBitrate, detectBitDepthFromBuffer } from './utils/audioParser';
+import { parseWavHeader, detectM4aCodec, parseM4aHeader, estimateBitrate, detectBitDepthFromBuffer } from './utils/audioParser';
 import { TrackItem } from './components/TrackItem';
 import { Play, Pause, Square, Mic, Upload, Download, Sparkles, AlertCircle, Globe, Plus, Cpu, Ruler } from 'lucide-react';
 
@@ -59,13 +59,21 @@ export default function App() {
       // 1. Detect Bit Depth & Sample Rate from original file before decoding
       const arrayBuffer = await file.arrayBuffer();
       let detectedWavInfo: { bitDepth: number, sampleRate: number } | null = null;
-      let m4aInfo: { codec: string, isLossless: boolean } | null = null;
+      let detectedM4aInfo: { sampleRate: number, codec: string } | null = null;
+      let m4aCodecInfo: { codec: string, isLossless: boolean } | null = null;
+      
       const lowerName = file.name.toLowerCase();
       
       if (lowerName.endsWith('.wav')) {
         detectedWavInfo = parseWavHeader(arrayBuffer);
       } else if (lowerName.match(/\.(m4a|mp4|aac)$/)) {
-        m4aInfo = detectM4aCodec(arrayBuffer);
+        // Parse M4A atoms for Sample Rate
+        try {
+          detectedM4aInfo = parseM4aHeader(arrayBuffer);
+        } catch (e) { console.warn("M4A parse failed", e); }
+        
+        // Also get codec type (ALAC vs AAC) heuristically
+        m4aCodecInfo = detectM4aCodec(arrayBuffer);
       }
 
       // 2. Decode for Web Audio (converts to 32-bit float internal, and resamples to context rate)
@@ -74,9 +82,9 @@ export default function App() {
       // 3. Determine Display Labels
       let bitDepthLabel = "Unknown";
       let bitrateLabel = "";
-      let displaySampleRate = buffer.sampleRate; // Default to context rate
+      let displaySampleRate = buffer.sampleRate; // Default to context rate (fallback)
 
-      // Bitrate Calculation
+      // Bitrate & Sample Rate Logic
       if (detectedWavInfo) {
          // Exact for Linear PCM: SampleRate * Channels * Bits
          const kbps = Math.round((detectedWavInfo.sampleRate * buffer.numberOfChannels * detectedWavInfo.bitDepth) / 1000);
@@ -86,8 +94,10 @@ export default function App() {
          // Approx for others: (Size * 8) / Duration
          const kbps = estimateBitrate(file.size, buffer.duration);
          bitrateLabel = `~${kbps} kbps`;
-         // For non-WAV, we unfortunately often rely on the decoded buffer rate 
-         // unless we parse MP3/AAC frames which is complex without libraries.
+         
+         if (detectedM4aInfo) {
+           displaySampleRate = detectedM4aInfo.sampleRate;
+         }
       }
 
       // Bit Depth / Format Label Generation
@@ -100,9 +110,10 @@ export default function App() {
 
         if (lowerName.endsWith('.flac')) {
           bitDepthLabel = `FLAC (${estString})`;
-        } else if (m4aInfo) {
-           // M4A (AAC or ALAC)
-           bitDepthLabel = `${m4aInfo.codec} (${estString})`;
+        } else if (lowerName.match(/\.(m4a|mp4|aac)$/)) {
+           // Combine header info and heuristic info
+           const codecName = m4aCodecInfo?.codec || detectedM4aInfo?.codec || "M4A";
+           bitDepthLabel = `${codecName} (${estString})`;
         } else if (lowerName.endsWith('.mp3')) {
           bitDepthLabel = `MP3 (${estString})`;
         } else if (lowerName.endsWith('.ogg')) {

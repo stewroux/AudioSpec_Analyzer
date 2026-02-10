@@ -60,6 +60,104 @@ export const parseWavHeader = (buffer: ArrayBuffer): { bitDepth: number, sampleR
 };
 
 /**
+ * Parses MP4/M4A container to find the original sample rate defined in the 'stsd' atom.
+ * This is necessary because Web Audio API resamples everything to the context rate.
+ */
+export const parseM4aHeader = (buffer: ArrayBuffer): { sampleRate: number, codec: string } | null => {
+  const dataView = new DataView(buffer);
+  
+  const findAtom = (start: number, end: number, targetType: string): { start: number, size: number } | null => {
+    let offset = start;
+    while (offset + 8 <= end) {
+      const size = dataView.getUint32(offset);
+      const type = String.fromCharCode(
+        dataView.getUint8(offset + 4),
+        dataView.getUint8(offset + 5),
+        dataView.getUint8(offset + 6),
+        dataView.getUint8(offset + 7)
+      );
+
+      if (type === targetType) {
+        return { start: offset, size: size };
+      }
+
+      // Atom size 0 means "rest of file", size 1 means extended size (64bit)
+      // For simplicity in this lightweight parser, we assume standard 32-bit sizes for headers
+      if (size < 8) break; 
+      
+      // If we are searching for a nested atom, we might need to go INTO containers (moov, trak, mdia, minf, stbl)
+      // But this linear scan at the current level skips siblings. 
+      // We implement "Path" logic outside.
+      offset += size;
+    }
+    return null;
+  };
+
+  const getAtomContent = (start: number, size: number) => {
+    return { start: start + 8, end: start + size };
+  };
+
+  // 1. Find 'moov' (Movie Atom)
+  const moov = findAtom(0, buffer.byteLength, 'moov');
+  if (!moov) return null;
+
+  // 2. Find 'trak' (Track Atom) - Use the first track
+  // Inside moov, we scan linearly for the first trak
+  const moovContent = getAtomContent(moov.start, moov.size);
+  const trak = findAtom(moovContent.start, moovContent.end, 'trak');
+  if (!trak) return null;
+
+  // 3. Find 'mdia' (Media Atom)
+  const trakContent = getAtomContent(trak.start, trak.size);
+  const mdia = findAtom(trakContent.start, trakContent.end, 'mdia');
+  if (!mdia) return null;
+
+  // 4. Find 'minf' (Media Information Atom)
+  const mdiaContent = getAtomContent(mdia.start, mdia.size);
+  const minf = findAtom(mdiaContent.start, mdiaContent.end, 'minf');
+  if (!minf) return null;
+
+  // 5. Find 'stbl' (Sample Table Atom)
+  const minfContent = getAtomContent(minf.start, minf.size);
+  const stbl = findAtom(minfContent.start, minfContent.end, 'stbl');
+  if (!stbl) return null;
+
+  // 6. Find 'stsd' (Sample Description Atom)
+  const stblContent = getAtomContent(stbl.start, stbl.size);
+  const stsd = findAtom(stblContent.start, stblContent.end, 'stsd');
+  if (!stsd) return null;
+
+  // Parse 'stsd'
+  // Header: 4 bytes size, 4 bytes type, 1 byte version, 3 bytes flags, 4 bytes entry_count
+  const stsdBodyStart = stsd.start + 16; 
+  // We assume the first entry is the audio description
+  const entrySize = dataView.getUint32(stsdBodyStart);
+  const entryType = String.fromCharCode(
+    dataView.getUint8(stsdBodyStart + 4),
+    dataView.getUint8(stsdBodyStart + 5),
+    dataView.getUint8(stsdBodyStart + 6),
+    dataView.getUint8(stsdBodyStart + 7)
+  );
+
+  // Parse AudioSampleEntry (mp4a, alac, etc)
+  // Structure (relative to entry start):
+  // 0-7: Header
+  // 8-13: Reserved
+  // 14-15: DataRefIndex
+  // 16-23: Reserved (Version/Revision/Vendor in QT)
+  // 24-25: ChannelCount
+  // 26-27: SampleSize
+  // 28-29: PreDefined
+  // 30-31: Reserved
+  // 32-35: SampleRate (16.16 Fixed Point)
+
+  const sampleRateFixed = dataView.getUint32(stsdBodyStart + 32);
+  const sampleRate = sampleRateFixed >>> 16; // Shift right 16 bits to get integer part
+
+  return { sampleRate, codec: entryType };
+};
+
+/**
  * Heuristically detects if an M4A file is ALAC (Lossless) or AAC (Lossy).
  * Scans the first 128KB for atom signatures.
  */
