@@ -8,6 +8,9 @@ import { TrackItem } from './components/TrackItem';
 import { SpectrumAnalyzer } from './components/SpectrumAnalyzer';
 import { Play, Pause, Square, Mic, Upload, Download, Sparkles, AlertCircle, Globe, Plus, Cpu, Ruler, ZoomIn, ZoomOut, MoveHorizontal, ChevronDown } from 'lucide-react';
 
+const MAX_FILE_SIZE_BYTES = 200 * 1024 * 1024; // 200 MB
+const MAX_AI_DURATION_SEC = 300; // 5 minutes
+
 export default function App() {
   const [lang, setLang] = useState<Language>('ja');
   const t = translations[lang];
@@ -101,6 +104,12 @@ export default function App() {
     const file = e.target.files?.[0];
     if (!file) return;
 
+    if (file.size > MAX_FILE_SIZE_BYTES) {
+      setErrorMessage('File size exceeds 200MB limit. Please use a smaller file.');
+      e.target.value = '';
+      return;
+    }
+
     setIsProcessing(true);
     try {
       initAudioContext();
@@ -116,7 +125,7 @@ export default function App() {
       if (lowerName.endsWith('.wav')) {
         detectedWavInfo = parseWavHeader(arrayBuffer);
       } else if (lowerName.match(/\.(m4a|mp4|aac)$/)) {
-        try { detectedM4aInfo = parseM4aHeader(arrayBuffer); } catch (e) { console.warn(e); }
+        try { detectedM4aInfo = parseM4aHeader(arrayBuffer); } catch { /* ignore optional metadata parse errors */ }
         m4aCodecInfo = detectM4aCodec(arrayBuffer);
       }
 
@@ -170,7 +179,6 @@ export default function App() {
       });
 
     } catch (err) {
-      console.error(err);
       setErrorMessage(t.decodeError);
     } finally {
       setIsProcessing(false);
@@ -306,7 +314,7 @@ export default function App() {
 
   const handleStop = () => {
     sourceNodesRef.current.forEach(node => {
-      try { node.stop(); } catch(e) {}
+      try { node.stop(); } catch { /* already stopped or not yet started */ }
     });
     sourceNodesRef.current = [];
     if (animationFrameRef.current) cancelAnimationFrame(animationFrameRef.current);
@@ -333,6 +341,12 @@ export default function App() {
 
   const handleAiAction = async (task: 'transcribe' | 'summarize') => {
     if (!audioContextRef.current || tracks.length === 0) return;
+
+    if (editorState.duration > MAX_AI_DURATION_SEC) {
+      setErrorMessage('Audio too long for AI analysis. Maximum is 5 minutes (300s).');
+      return;
+    }
+
     setIsProcessing(true);
     setAiResult(null);
 
@@ -345,7 +359,6 @@ export default function App() {
         summary: task === 'summarize' ? text : undefined
       });
     } catch (err) {
-      console.error(err);
       setErrorMessage("AI Analysis Failed. Check API Key or Audio length.");
     } finally {
       setIsProcessing(false);
