@@ -18,6 +18,12 @@ A browser-based multi-track audio editor (DAW) powered by Google Gemini AI. Impo
   - **Summarization**: Generate summaries of audio content.
 - **Export**: Mixdown your project to a stereo WAV file.
 
+## 📋 Requirements
+
+- **Node.js** >= 20 (CI runs on 20 and 22)
+- **npm** >= 10
+- A **Google Gemini API key** — get one at <https://aistudio.google.com/apikey>
+
 ## 🚀 Getting Started
 
 1. **Install Dependencies**
@@ -26,7 +32,13 @@ A browser-based multi-track audio editor (DAW) powered by Google Gemini AI. Impo
    ```
 
 2. **Set API Key**
-   Ensure your environment is configured with `API_KEY` for Google Gemini.
+
+   ```bash
+   cp .env.example .env
+   # then edit .env and set GEMINI_API_KEY (and SERVER_SIDE_API_KEY for the server)
+   ```
+
+   Vite injects `GEMINI_API_KEY` into the client at build time (see `vite.config.ts`).
 
 3. **Run Development Server**
    ```bash
