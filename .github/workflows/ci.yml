@@ -1,0 +1,57 @@
+# Reusable OSS CI for Node.js projects.
+# Defensive by design: missing lockfile / scripts must NOT turn the build red.
+name: CI
+
+on:
+  push:
+    branches: [main, master, dev]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        node-version: ['20', '22']
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Detect package manager
+        id: pm
+        run: |
+          if [ -f pnpm-lock.yaml ]; then echo "pm=pnpm" >> "$GITHUB_OUTPUT";
+          elif [ -f yarn.lock ]; then echo "pm=yarn" >> "$GITHUB_OUTPUT";
+          else echo "pm=npm" >> "$GITHUB_OUTPUT"; fi
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: ${{ matrix.node-version }}
+
+      - name: Install dependencies
+        run: |
+          if [ "${{ steps.pm.outputs.pm }}" = "pnpm" ]; then
+            corepack enable && pnpm install --frozen-lockfile || pnpm install
+          elif [ "${{ steps.pm.outputs.pm }}" = "yarn" ]; then
+            corepack enable && yarn install --frozen-lockfile || yarn install
+          elif [ -f package-lock.json ]; then
+            npm ci || npm install
+          else
+            npm install
+          fi
+
+      - name: Lint (if present)
+        run: npm run lint --if-present
+
+      - name: Type check (if present)
+        run: npm run typecheck --if-present
+
+      - name: Build (if present)
+        run: npm run build --if-present
+
+      - name: Test (if present)
+        run: npm test --if-present
