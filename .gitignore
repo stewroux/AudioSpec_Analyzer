@@ -22,3 +22,8 @@ dist-ssr
 *.njsproj
 *.sln
 *.sw?
+
+# Added by oss-harness: never commit secrets
+.env
+.env.*
+!.env.example
